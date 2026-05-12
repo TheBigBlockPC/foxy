@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Foxy logo">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="40%" r="70%">
+      <stop offset="0%" stop-color="#293655"/>
+      <stop offset="100%" stop-color="#070a12"/>
+    </radialGradient>
+    <linearGradient id="fox" x1="90" y1="80" x2="430" y2="440">
+      <stop offset="0%" stop-color="#ffb44d"/>
+      <stop offset="55%" stop-color="#ff6a2f"/>
+      <stop offset="100%" stop-color="#d93868"/>
+    </linearGradient>
+    <linearGradient id="cyan" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#64f2ff"/>
+      <stop offset="100%" stop-color="#6e7dff"/>
+    </linearGradient>
+  </defs>
+  <circle cx="256" cy="256" r="232" fill="url(#bg)" stroke="#35405e" stroke-width="10"/>
+  <path d="M116 126 L190 182 L256 128 L322 182 L396 126 L363 284 C351 349 309 388 256 388 C203 388 161 349 149 284 Z" fill="url(#fox)"/>
+  <path d="M190 182 L151 134 L169 242 Z" fill="#ffcf75" opacity=".85"/>
+  <path d="M322 182 L361 134 L343 242 Z" fill="#ffcf75" opacity=".85"/>
+  <path d="M189 285 C207 329 230 352 256 352 C282 352 305 329 323 285 C302 305 278 315 256 315 C234 315 210 305 189 285 Z" fill="#fff2dc"/>
+  <path d="M228 260 L256 292 L284 260 C271 268 241 268 228 260 Z" fill="#111827"/>
+  <circle cx="213" cy="236" r="15" fill="#101420"/>
+  <circle cx="299" cy="236" r="15" fill="#101420"/>
+  <path d="M68 256 C110 176 178 128 256 128 C334 128 402 176 444 256" fill="none" stroke="url(#cyan)" stroke-width="16" stroke-linecap="round" opacity=".55"/>
+  <path d="M72 316 C128 386 190 420 256 420 C322 420 384 386 440 316" fill="none" stroke="url(#cyan)" stroke-width="16" stroke-linecap="round" opacity=".75"/>
+  <text x="256" y="470" text-anchor="middle" font-size="54" font-family="Inter, system-ui, sans-serif" font-weight="800" fill="#f8fbff">FOXY</text>
+</svg>

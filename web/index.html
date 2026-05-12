@@ -1,0 +1,1041 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Foxy SDK</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0;
+      background: #080a10;
+      color: #f4f7ff;
+      font-family: system-ui, -apple-system, Segoe UI, sans-serif;
+    }
+    main {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    header {
+      display: flex;
+      gap: 18px;
+      align-items: center;
+    }
+    header img {
+      width: 86px;
+      height: 86px;
+    }
+    button {
+      font: inherit;
+      padding: 12px 16px;
+      border-radius: 12px;
+      border: 1px solid #3d465c;
+      background: #20283a;
+      color: white;
+      cursor: pointer;
+      margin: 4px;
+    }
+    button:hover { background: #2c374f; }
+    #preview {
+      width: min(100%, 960px);
+      height: auto;
+      background: #111827;
+      border: 1px solid #30394b;
+      border-radius: 16px;
+      margin-top: 16px;
+    }
+    #log {
+      white-space: pre-wrap;
+      background: #111622;
+      border: 1px solid #30394b;
+      border-radius: 16px;
+      padding: 14px;
+      min-height: 150px;
+      margin-top: 16px;
+      line-height: 1.35;
+    }
+    .pill {
+      display: inline-block;
+      border: 1px solid #344055;
+      background: #121827;
+      padding: 8px 10px;
+      border-radius: 999px;
+      margin: 4px;
+      font-size: 14px;
+    }
+    .pill.good { border-color: #3f6f57; background: #0e241a; }
+    .pill.warn { border-color: #8a6a2f; background: #2a210d; }
+    .pill.bad { border-color: #88474a; background: #2b1115; }
+    canvas { display: none; }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <img src="/assets/foxy_logo.svg" alt="Foxy logo">
+    <div>
+      <h1>Foxy SDK</h1>
+      <p>Linux GPU stereo renderer + Quest WebXR tracking + IPC Python experiences.</p>
+    </div>
+  </header>
+
+  <p>
+    <button id="enter">Enter VR</button>
+    <button id="reconnect">Reconnect</button>
+    <button id="reset">Reset Pose</button>
+    <button id="toggleReprojection">Toggle Reprojection</button>
+    <button id="enableAudio">Enable Audio</button>
+    <button id="startMic">Start Mic → PC</button>
+    <button id="stopMic">Stop Mic</button>
+  </p>
+
+  <div>
+    <span class="pill" id="xrStatus">XR: unknown</span>
+    <span class="pill" id="wsStatus">WS: disconnected</span>
+    <span class="pill" id="modeStatus">mode: hub</span>
+    <span class="pill" id="fps">frames: 0</span>
+    <span class="pill" id="tracking">tracking: 0</span>
+    <span class="pill" id="latency">latency: n/a</span>
+    <span class="pill" id="streamStatus">stream: starting</span>
+    <span class="pill" id="reprojStatus">reprojection: on</span>
+    <span class="pill" id="audioStatus">audio: off</span>
+    <span class="pill" id="micStatus">mic: off</span>
+    <span class="pill" id="controllerStatus">controllers: none</span>
+  </div>
+
+  <img id="preview" alt="PC-rendered side-by-side stereo preview">
+  <div id="log"></div>
+</main>
+
+<canvas id="glcanvas"></canvas>
+
+<script>
+const logEl = document.querySelector("#log");
+const preview = document.querySelector("#preview");
+const xrStatus = document.querySelector("#xrStatus");
+const wsStatus = document.querySelector("#wsStatus");
+const modeStatus = document.querySelector("#modeStatus");
+const fpsEl = document.querySelector("#fps");
+const trackingEl = document.querySelector("#tracking");
+const latencyEl = document.querySelector("#latency");
+const streamStatus = document.querySelector("#streamStatus");
+const reprojStatus = document.querySelector("#reprojStatus");
+const audioStatus = document.querySelector("#audioStatus");
+const micStatus = document.querySelector("#micStatus");
+const controllerStatus = document.querySelector("#controllerStatus");
+
+function log(msg) {
+  const t = new Date().toLocaleTimeString();
+  logEl.textContent += `[${t}] ${msg}\n`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+let ws = null;
+let wsGeneration = 0;
+let nextFrameMeta = null;
+let activeFrameMeta = null;
+let pendingBinaryType = null;
+let receivedFrames = 0;
+let acceptedFrames = 0;
+let clientDroppedFrames = 0;
+let decodeErrors = 0;
+let consecutiveDecodeErrors = 0;
+let lastGoodFrameAt = performance.now();
+let lastPreviewUpdateAt = 0;
+let lastTextureUploadAt = 0;
+let lastDropAt = 0;
+let concealUntil = 0;
+let lastRecoverAt = 0;
+let trackingPackets = 0;
+let latestBitmap = null;
+let pendingUploadMeta = null;
+let pendingUploadDecodeMs = 0;
+let latestObjectUrl = null;
+let latestEyeWidth = 960;
+let latestEyeHeight = 960;
+let reprojectionEnabled = true;
+let audioCtx = null;
+let audioQueueTime = 0;
+let audioEnabled = false;
+let micStream = null;
+let micRecorder = null;
+let queuedInputEvents = [];
+let decodeBusy = false;
+let pendingVideo = null;
+let decodeGeneration = 0;
+let lastSeenStreamEpoch = 0;
+let serverClockOffsetMs = null;
+let lastAcceptedStreamSeq = 0;
+const qs = new URLSearchParams(location.search);
+const DOM_PREVIEW_ENABLED = qs.get("preview") === "1";
+// This is now a display warning only. Do not drop based on wall-clock serverTimeMs,
+// because the PC and Quest clocks can be hundreds/thousands of ms apart.
+const MAX_CLIENT_FRAME_AGE_MS = Number(qs.get("maxAgeMs") || 240);
+// Local queue age is measured entirely on the Quest, so it is safe for drop decisions.
+const MAX_LOCAL_QUEUE_MS = Number(qs.get("maxLocalQueueMs") || 350);
+const WATCHDOG_STALL_MS = Number(qs.get("watchdogMs") || 1800);
+const MAX_CONSECUTIVE_DECODE_ERRORS = Number(qs.get("maxDecodeErrors") || 8);
+
+function setStreamStatus(text, cls = "") {
+  streamStatus.textContent = text;
+  streamStatus.className = `pill ${cls}`.trim();
+}
+
+function sendJSON(obj) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  try { ws.send(JSON.stringify(obj)); } catch (e) {}
+}
+
+function frameId(meta) {
+  return Number((meta && (meta.streamSeq ?? meta.frame)) || 0);
+}
+
+function sendFrameAck(meta, ok, extra = {}) {
+  sendJSON({
+    type: "frame-ack",
+    streamSeq: frameId(meta),
+    frame: meta?.frame || 0,
+    streamEpoch: meta?.streamEpoch || lastSeenStreamEpoch || 0,
+    ok,
+    clientTimeMs: performance.timeOrigin + performance.now(),
+    ...extra
+  });
+}
+
+function correctedServerAgeMs(meta) {
+  if (!meta || !meta.serverTimeMs || serverClockOffsetMs === null) return null;
+  return Math.max(0, performance.timeOrigin + performance.now() - (Number(meta.serverTimeMs) + serverClockOffsetMs));
+}
+
+function markDroppedFrame(reason = "drop") {
+  lastDropAt = performance.now();
+  // Dropping a frame must never clear or camera-lock the image.  The XR draw
+  // path keeps the last uploaded GL texture and reprojects it from the pose
+  // captured when that texture was rendered.  That preserves the old behavior:
+  // if the stream stops, the last frame hangs in world space instead of moving
+  // with the headset like a HUD.
+  concealUntil = Math.max(concealUntil, lastDropAt + 180);
+  if (reason) setStreamStatus(`stream: ${reason} - holding world-locked last frame`, "warn");
+}
+
+function maybeUpdateLatency(meta, decodeMs = 0, dropped = false) {
+  const serverAge = correctedServerAgeMs(meta);
+  const localQueueMs = meta && meta._clientMetaReceivedAt ? performance.now() - meta._clientMetaReceivedAt : 0;
+  const heldMs = lastTextureUploadAt ? performance.now() - lastTextureUploadAt : 0;
+  const ageText = serverAge === null ? "syncing" : `${serverAge.toFixed(0)} ms`;
+  latencyEl.textContent = `latency-ish: ${ageText} | local queue: ${Math.max(0, localQueueMs).toFixed(0)} ms | held: ${heldMs.toFixed(0)} ms | decode: ${decodeMs.toFixed(1)} ms | drop: ${clientDroppedFrames}`;
+  if (dropped) {
+    markDroppedFrame("drop");
+  } else if (consecutiveDecodeErrors > 0) {
+    setStreamStatus("stream: recovering - holding last good frame", "warn");
+  } else {
+    setStreamStatus("stream: stable", "good");
+  }
+}
+
+function resetStreamTexture() {
+  if (latestBitmap) {
+    try { latestBitmap.close?.(); } catch (e) {}
+  }
+  latestBitmap = null;
+  textureDirty = false;
+  lastTextureUploadAt = 0;
+  activeFrameMeta = null;
+  pendingUploadMeta = null;
+  pendingUploadDecodeMs = 0;
+  nextFrameMeta = null;
+  pendingVideo = null;
+  if (latestObjectUrl) {
+    URL.revokeObjectURL(latestObjectUrl);
+    latestObjectUrl = null;
+  }
+  if (gl && streamTex) {
+    gl.bindTexture(gl.TEXTURE_2D, streamTex);
+    const placeholder = new Uint8Array([20,24,36,255, 55,64,88,255, 55,64,88,255, 20,24,36,255]);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 2, 2, 0, gl.RGBA, gl.UNSIGNED_BYTE, placeholder);
+  }
+}
+
+function requestStreamResync(reason, clearVisibleFrame = false) {
+  const now = performance.now();
+  if (now - lastRecoverAt < 350) return;
+  lastRecoverAt = now;
+
+  // A bad/stale frame is a stream-health problem, not a socket-health problem.
+  // Keep the WebSocket open, keep the last good image visible, and only drop
+  // queued decode state.  Reconnecting here creates the exact connect/fail loop
+  // we want to avoid on weaker hardware.
+  nextFrameMeta = null;
+  pendingBinaryType = null;
+  pendingVideo = null;
+  pendingUploadMeta = null;
+  pendingUploadDecodeMs = 0;
+  decodeBusy = false;
+  decodeGeneration++;
+  if (clearVisibleFrame) resetStreamTexture();
+
+  setStreamStatus(`stream: resync requested (${reason})`, "warn");
+  sendJSON({
+    type: "stream-error",
+    reason,
+    keepSocket: true,
+    clientTimeMs: performance.timeOrigin + performance.now()
+  });
+  log(`Stream resync requested: ${reason}. Socket stays open; queued frames are dropped.`);
+}
+
+function hardRecoverStream(reason, reconnect = false) {
+  // Backward-compatible wrapper: only reconnect if the WebSocket itself is
+  // already closed/closing.  Video decode errors should never force reconnect.
+  if (reconnect && ws && (ws.readyState === WebSocket.CLOSING || ws.readyState === WebSocket.CLOSED)) {
+    setTimeout(connect, 400);
+    return;
+  }
+  requestStreamResync(reason, false);
+}
+
+function queueVideoFrame(blob) {
+  const meta = nextFrameMeta;
+  nextFrameMeta = null;
+  if (!meta) {
+    clientDroppedFrames++;
+    markDroppedFrame("dropped binary without metadata");
+    return;
+  }
+
+  lastSeenStreamEpoch = meta.streamEpoch || lastSeenStreamEpoch || 0;
+  meta._binaryReceivedAt = performance.now();
+  const localAge = meta._clientMetaReceivedAt ? Math.max(0, performance.now() - meta._clientMetaReceivedAt) : 0;
+
+  // Never use serverTimeMs as a hard drop condition. The Quest and Linux PC clocks
+  // are not guaranteed to be synchronized, and that made every frame look stale on
+  // some setups. Only local Quest-side queue age may reject a frame.
+  if (acceptedFrames > 0 && localAge > MAX_LOCAL_QUEUE_MS) {
+    clientDroppedFrames++;
+    markDroppedFrame("local queue stale");
+    sendFrameAck(meta, false, { reason: "local-queue-stale", localAgeMs: localAge, droppedClientFrames: clientDroppedFrames });
+    maybeUpdateLatency(meta, 0, true);
+    return;
+  }
+
+  if (pendingVideo) {
+    clientDroppedFrames++;
+    markDroppedFrame("superseded queued frame");
+    sendFrameAck(pendingVideo.meta, false, { reason: "superseded", droppedClientFrames: clientDroppedFrames });
+  }
+  pendingVideo = { blob, meta, queuedAt: performance.now() };
+  processVideoQueue();
+}
+
+async function processVideoQueue() {
+  if (decodeBusy || !pendingVideo) return;
+  // In VR, do not decode the next JPEG while a decoded bitmap is still waiting
+  // for texImage2D. Otherwise a fast decoder can repeatedly replace the staged
+  // bitmap before the XR render loop ever displays it, which looks like massive
+  // frame dropping / slideshow behavior.
+  if (xrSession && textureDirty && latestBitmap) {
+    setTimeout(processVideoQueue, 1);
+    return;
+  }
+  const item = pendingVideo;
+  pendingVideo = null;
+  decodeBusy = true;
+  const meta = item.meta;
+  const generation = decodeGeneration;
+  const start = performance.now();
+
+  try {
+    const bmp = await createImageBitmap(item.blob);
+    if (generation !== decodeGeneration) {
+      try { bmp.close?.(); } catch (e) {}
+      clientDroppedFrames++;
+      markDroppedFrame("superseded by resync");
+      sendFrameAck(meta, false, { reason: "superseded-by-resync", droppedClientFrames: clientDroppedFrames });
+      return;
+    }
+    const decodeMs = performance.now() - start;
+    // Do NOT discard a frame merely because a newer frame arrived while this one
+    // was decoding. That caused the client to reject almost every completed
+    // decode whenever the PC sent faster than Quest Browser could decode. Display
+    // the latest completed decode, keep at most one newer pending frame, and let
+    // the next decode catch up.
+    const expectedW = Number(meta.eyeWidth || latestEyeWidth) * 2;
+    const expectedH = Number(meta.eyeHeight || latestEyeHeight);
+    if (bmp.width !== expectedW || bmp.height !== expectedH) {
+      try { bmp.close?.(); } catch (e) {}
+      throw new Error(`bad bitmap size ${bmp.width}x${bmp.height}, expected ${expectedW}x${expectedH}`);
+    }
+
+    // A decoded bitmap is only staged here. It does not become ground truth
+    // until texImage2D succeeds on the XR render thread. This keeps texture and
+    // pose/reprojection metadata paired, so fallback cannot sample an old image
+    // using a newer frame's metadata.
+    if (latestBitmap) {
+      try { latestBitmap.close?.(); } catch (e) {}
+      clientDroppedFrames++;
+    }
+    latestBitmap = bmp;
+    pendingUploadMeta = meta;
+    pendingUploadDecodeMs = decodeMs;
+    latestEyeWidth = meta.eyeWidth || latestEyeWidth;
+    latestEyeHeight = meta.eyeHeight || latestEyeHeight;
+    textureDirty = true;
+    consecutiveDecodeErrors = 0;
+    // Do not ACK here.  ACKing at decode time lets the PC send the next JPEG
+    // before the current image has actually reached the XR texture, which can
+    // make weak hardware appear to run as a constant drop storm.  The ACK is
+    // sent only after texImage2D succeeds in drawEye().
+    maybeUpdateLatency(meta, decodeMs, false);
+
+    if (DOM_PREVIEW_ENABLED && !xrSession && performance.now() - lastPreviewUpdateAt > 500) {
+      lastPreviewUpdateAt = performance.now();
+      if (latestObjectUrl) URL.revokeObjectURL(latestObjectUrl);
+      latestObjectUrl = URL.createObjectURL(item.blob);
+      preview.src = latestObjectUrl;
+    }
+  } catch (e) {
+    decodeErrors++;
+    consecutiveDecodeErrors++;
+    sendFrameAck(meta, false, {
+      reason: "decode",
+      message: String(e && e.message || e),
+      decodeErrors,
+      consecutiveDecodeErrors,
+      droppedClientFrames: clientDroppedFrames
+    });
+    log("Frame decode rejected: " + (e && e.message || e));
+    markDroppedFrame("decode error");
+    if (consecutiveDecodeErrors >= MAX_CONSECUTIVE_DECODE_ERRORS) {
+      requestStreamResync("consecutive-decode-errors", false);
+    } else {
+      // Do not reset the texture or reconnect. The last good frame stays visible
+      // while the server is told that this frame was rejected.
+      setStreamStatus("stream: decode error - frame dropped", "warn");
+    }
+  } finally {
+    decodeBusy = false;
+    if (pendingVideo) setTimeout(processVideoQueue, 0);
+  }
+}
+
+function connect() {
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+    try { ws.close(1000, "client-reconnect"); } catch (e) { try { ws.close(); } catch (_) {} }
+  }
+
+  const generation = ++wsGeneration;
+  nextFrameMeta = null;
+  pendingBinaryType = null;
+  pendingVideo = null;
+  pendingUploadMeta = null;
+  pendingUploadDecodeMs = 0;
+  decodeBusy = false;
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  ws = new WebSocket(`${proto}//${location.host}/ws`);
+  ws.binaryType = "blob";
+
+  ws.onopen = () => {
+    if (generation !== wsGeneration) return;
+    wsStatus.textContent = "WS: connected";
+    setStreamStatus("stream: connected", "good");
+    log("WebSocket connected.");
+  };
+
+  ws.onclose = () => {
+    if (generation !== wsGeneration) return;
+    wsStatus.textContent = "WS: closed";
+    setStreamStatus("stream: disconnected", "bad");
+    log("WebSocket closed.");
+  };
+
+  ws.onerror = () => {
+    if (generation !== wsGeneration) return;
+    wsStatus.textContent = "WS: error";
+    setStreamStatus("stream: socket error", "bad");
+    log("WebSocket error.");
+  };
+
+  ws.onmessage = (ev) => {
+    if (generation !== wsGeneration) return;
+    if (typeof ev.data === "string") {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === "hello") {
+        latestEyeWidth = msg.eyeWidth || latestEyeWidth;
+        latestEyeHeight = msg.eyeHeight || latestEyeHeight;
+        if (msg.serverTimeMs) serverClockOffsetMs = performance.timeOrigin + performance.now() - Number(msg.serverTimeMs);
+        log(`${msg.message}. Server eye frame: ${latestEyeWidth}x${latestEyeHeight}, fps target: ${msg.fps}`);
+      } else if (msg.type === "frame-meta") {
+        if (msg.serverTimeMs) {
+          const roughOffset = performance.timeOrigin + performance.now() - Number(msg.serverTimeMs);
+          serverClockOffsetMs = serverClockOffsetMs === null ? roughOffset : (serverClockOffsetMs * 0.98 + roughOffset * 0.02);
+        }
+        msg._clientMetaReceivedAt = performance.now();
+        if (nextFrameMeta) {
+          clientDroppedFrames++;
+          markDroppedFrame("metadata superseded");
+          sendFrameAck(nextFrameMeta, false, { reason: "metadata-superseded", droppedClientFrames: clientDroppedFrames });
+        }
+        nextFrameMeta = msg;
+        latestEyeWidth = msg.eyeWidth || latestEyeWidth;
+        latestEyeHeight = msg.eyeHeight || latestEyeHeight;
+        if (msg.mode) modeStatus.textContent = `mode: ${msg.mode}${msg.appName ? " / " + msg.appName : ""}`;
+      } else if (msg.type === "audio-meta") {
+        pendingBinaryType = msg;
+      } else if (msg.type === "stream-resync") {
+        lastSeenStreamEpoch = msg.streamEpoch || lastSeenStreamEpoch || 0;
+        // Server-side resync invalidates queued state only. Keep the last good
+        // decoded bitmap active; a JPEG frame is intra-coded, so the next valid
+        // frame becomes ground truth without tearing down the socket.
+        nextFrameMeta = null;
+        pendingVideo = null;
+        pendingUploadMeta = null;
+        pendingUploadDecodeMs = 0;
+        pendingBinaryType = null;
+        decodeGeneration++;
+        decodeBusy = false;
+        markDroppedFrame("server resync");
+        setStreamStatus(`stream: resynced (${msg.reason || "server"}) - holding last good frame`, "warn");
+      } else if (msg.type === "audio-state") {
+        audioEnabled = !!msg.enabled;
+        audioStatus.textContent = `audio: ${audioEnabled ? "on" : "off"}`;
+      } else if (msg.type === "haptic") {
+        pulseHaptics(msg.handedness, msg.durationMs || 35, msg.intensity || 0.25);
+      } else if (msg.type === "reset-ok") {
+        log("Server reset acknowledged.");
+      }
+      return;
+    }
+
+    if (pendingBinaryType && pendingBinaryType.type === "audio-meta") {
+      handleAudioChunk(ev.data, pendingBinaryType);
+      pendingBinaryType = null;
+      return;
+    }
+
+    receivedFrames++;
+    fpsEl.textContent = `frames: ${acceptedFrames}/${receivedFrames} | dropped: ${clientDroppedFrames}`;
+    queueVideoFrame(ev.data);
+  };
+}
+
+document.querySelector("#reconnect").onclick = connect;
+document.querySelector("#reset").onclick = () => {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "reset" }));
+};
+
+document.querySelector("#toggleReprojection").onclick = () => {
+  reprojectionEnabled = !reprojectionEnabled;
+  reprojStatus.textContent = `reprojection: ${reprojectionEnabled ? "on" : "off"}`;
+  log("Client-side rotational reprojection " + (reprojectionEnabled ? "enabled." : "disabled."));
+};
+
+connect();
+
+window.addEventListener("pagehide", () => {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try { ws.close(1000, "pagehide"); } catch (e) {}
+  }
+});
+
+setInterval(() => {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    sendJSON({ type: "ping", clientTimeMs: performance.timeOrigin + performance.now() });
+  } else if (!ws || ws.readyState === WebSocket.CLOSED) {
+    // Only reconnect for actual socket loss, not stream decode failures.
+    connect();
+  }
+}, 2000);
+
+async function enableAudio() {
+  audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+  await audioCtx.resume();
+  audioQueueTime = Math.max(audioQueueTime, audioCtx.currentTime + 0.08);
+  audioEnabled = true;
+  audioStatus.textContent = "audio: on";
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "audio-control", enabled: true }));
+  }
+  log("Audio enabled. Demo tone should play quietly.");
+}
+document.querySelector("#enableAudio").onclick = () => enableAudio().catch(e => log("Enable audio failed: " + e.message));
+
+async function handleAudioChunk(blob, meta) {
+  if (!audioEnabled || !audioCtx) return;
+  const ab = await blob.arrayBuffer();
+  const pcm = new Int16Array(ab);
+  const channels = meta.channels || 2;
+  const sampleRate = meta.sampleRate || 48000;
+  const frames = Math.floor(pcm.length / channels);
+
+  const buffer = audioCtx.createBuffer(channels, frames, sampleRate);
+  for (let ch = 0; ch < channels; ch++) {
+    const data = buffer.getChannelData(ch);
+    for (let i = 0; i < frames; i++) data[i] = pcm[i * channels + ch] / 32768.0;
+  }
+
+  const src = audioCtx.createBufferSource();
+  src.buffer = buffer;
+  src.connect(audioCtx.destination);
+  const when = Math.max(audioCtx.currentTime + 0.02, audioQueueTime);
+  src.start(when);
+  audioQueueTime = when + buffer.duration;
+}
+
+async function startMic() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    log("getUserMedia is unavailable in this browser/context.");
+    return;
+  }
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 }
+  });
+
+  const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/webm";
+  micRecorder = new MediaRecorder(micStream, { mimeType: mime });
+  micRecorder.ondataavailable = async (ev) => {
+    if (!ev.data || ev.data.size === 0 || !ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: "mic-meta", mimeType: mime, bytes: ev.data.size, clientTimeMs: performance.timeOrigin + performance.now() }));
+    ws.send(ev.data);
+  };
+  micRecorder.onstart = () => { micStatus.textContent = "mic: streaming"; log("Quest mic streaming to PC."); };
+  micRecorder.onstop = () => { micStatus.textContent = "mic: off"; log("Quest mic stopped."); };
+  micRecorder.start(250);
+}
+
+function stopMic() {
+  if (micRecorder && micRecorder.state !== "inactive") micRecorder.stop();
+  if (micStream) for (const t of micStream.getTracks()) t.stop();
+  micStream = null;
+  micRecorder = null;
+}
+document.querySelector("#startMic").onclick = () => startMic().catch(e => log("Start mic failed: " + e.message));
+document.querySelector("#stopMic").onclick = stopMic;
+
+function sendInputEvent(eventName, inputSource) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const payload = {
+    type: "input-event",
+    event: eventName,
+    handedness: inputSource.handedness || "",
+    targetRayMode: inputSource.targetRayMode || "",
+    profiles: inputSource.profiles || [],
+    profile: (inputSource.profiles || [])[0] || "",
+    clientTimeMs: performance.timeOrigin + performance.now()
+  };
+  ws.send(JSON.stringify(payload));
+  queuedInputEvents.push(payload);
+  if (queuedInputEvents.length > 16) queuedInputEvents.shift();
+}
+
+function pulseHaptics(handedness, durationMs, intensity) {
+  if (!xrSession) return;
+  for (const src of xrSession.inputSources) {
+    if (handedness && src.handedness !== handedness) continue;
+    const gp = src.gamepad;
+    const actuator = gp && (gp.hapticActuators?.[0] || gp.vibrationActuator);
+    try {
+      if (actuator?.pulse) actuator.pulse(intensity, durationMs);
+      else if (actuator?.playEffect) actuator.playEffect("dual-rumble", { duration: durationMs, strongMagnitude: intensity, weakMagnitude: intensity });
+    } catch (e) {}
+  }
+}
+
+let gl = null, xrSession = null, refSpace = null, program = null, quadBuffer = null, streamTex = null, textureDirty = false;
+
+function createShader(gl, type, source) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, source);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
+  return sh;
+}
+
+function createProgram(gl, vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, createShader(gl, gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, createShader(gl, gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+
+function initGL() {
+  const canvas = document.querySelector("#glcanvas");
+  gl = canvas.getContext("webgl", { xrCompatible: true, antialias: false, alpha: false, depth: false, stencil: false });
+  if (!gl) throw new Error("WebGL unavailable");
+
+  const vs = `
+    attribute vec2 a_pos;
+    attribute vec2 a_uv;
+    varying vec2 v_ndc;
+    varying vec2 v_uv_fallback;
+    void main() {
+      v_ndc = a_pos;
+      v_uv_fallback = a_uv;
+      gl_Position = vec4(a_pos, 0.0, 1.0);
+    }
+  `;
+
+  const fs = `
+    precision mediump float;
+    varying vec2 v_ndc;
+    varying vec2 v_uv_fallback;
+    uniform sampler2D u_tex;
+    uniform float u_eye;
+    uniform float u_reproject;
+    uniform mat4 u_reproject_matrix;
+
+    void main() {
+      vec2 uvLocal = v_uv_fallback;
+      if (u_reproject > 0.5) {
+        // World-locked last-frame reprojection:
+        // Cast the current pixel ray through the current eye projection and ask
+        // where that same world-space ray landed in the last successfully
+        // uploaded frame.  If the stream drops/stalls, this keeps the frozen
+        // image attached to the world instead of glued to the headset camera.
+        vec4 oldClip = u_reproject_matrix * vec4(v_ndc.xy, 1.0, 1.0);
+        if (oldClip.w > 0.00001) {
+          vec2 oldNdc = oldClip.xy / oldClip.w;
+          vec2 projectedUv = vec2(0.5 + 0.5 * oldNdc.x, 0.5 - 0.5 * oldNdc.y);
+          // Do not blend back to v_uv_fallback on drops.  v_uv_fallback is a
+          // headset-locked fullscreen image, which makes latency feel worse.
+          // Clamp instead: edge smear is less disruptive than camera-locked
+          // motion or black flicker.
+          uvLocal = clamp(projectedUv, vec2(0.0), vec2(1.0));
+        }
+      }
+      vec2 uv = uvLocal;
+      uv.x = uv.x * 0.5 + 0.5 * u_eye;
+      gl_FragColor = texture2D(u_tex, uv);
+    }
+  `;
+
+  program = createProgram(gl, vs, fs);
+
+  const quad = new Float32Array([-1,-1,0,1, 1,-1,1,1, -1,1,0,0, 1,1,1,0]);
+  quadBuffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+
+  streamTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, streamTex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const placeholder = new Uint8Array([20,24,36,255, 55,64,88,255, 55,64,88,255, 20,24,36,255]);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 2, 2, 0, gl.RGBA, gl.UNSIGNED_BYTE, placeholder);
+}
+
+async function checkXR() {
+  if (!navigator.xr) {
+    xrStatus.textContent = "XR: missing";
+    log("navigator.xr missing. Use Quest Browser, secure context, or adb localhost.");
+    return;
+  }
+  try {
+    const ok = await navigator.xr.isSessionSupported("immersive-vr");
+    xrStatus.textContent = ok ? "XR: immersive-vr supported" : "XR: not supported";
+    log("immersive-vr supported: " + ok);
+  } catch (e) {
+    xrStatus.textContent = "XR: error";
+    log("XR support check failed: " + e.message);
+  }
+}
+checkXR();
+
+async function enterVR() {
+  if (!navigator.xr) throw new Error("navigator.xr is missing");
+  if (!gl) initGL();
+
+  xrSession = await navigator.xr.requestSession("immersive-vr", { optionalFeatures: ["local-floor", "bounded-floor", "hand-tracking"] });
+  xrSession.updateRenderState({ baseLayer: new XRWebGLLayer(xrSession, gl) });
+  refSpace = await xrSession.requestReferenceSpace("local-floor").catch(() => xrSession.requestReferenceSpace("local"));
+
+  xrSession.addEventListener("end", () => { xrStatus.textContent = "XR: ended"; log("XR session ended."); });
+  for (const name of ["selectstart", "selectend", "select", "squeezestart", "squeezeend", "squeeze"]) {
+    xrSession.addEventListener(name, (ev) => sendInputEvent(name, ev.inputSource));
+  }
+  xrSession.addEventListener("inputsourceschange", () => log("XR input sources changed."));
+
+  xrStatus.textContent = "XR: running";
+  log("XR session started.");
+  xrSession.requestAnimationFrame(onXRFrame);
+}
+document.querySelector("#enter").onclick = () => enterVR().catch(e => log("Enter VR failed: " + e.message));
+
+function normalizeXZ(x, z) {
+  const n = Math.hypot(x, z);
+  if (!Number.isFinite(n) || n < 1e-5) return null;
+  return { x: x / n, z: z / n };
+}
+
+function rotateVecByQuat(q, v) {
+  // WebXR orientations are unit quaternions that rotate local-space vectors into
+  // the XR reference space. This avoids matrix row/column ambiguity for heading.
+  const x = q.x, y = q.y, z = q.z, w = q.w;
+  const vx = v.x, vy = v.y, vz = v.z;
+  const tx = 2 * (y * vz - z * vy);
+  const ty = 2 * (z * vx - x * vz);
+  const tz = 2 * (x * vy - y * vx);
+  return {
+    x: vx + w * tx + (y * tz - z * ty),
+    y: vy + w * ty + (z * tx - x * tz),
+    z: vz + w * tz + (x * ty - y * tx)
+  };
+}
+
+function flatHeadingFromOrientation(orientation) {
+  if (!orientation) return null;
+  const q = {
+    x: Number(orientation.x),
+    y: Number(orientation.y),
+    z: Number(orientation.z),
+    w: Number(orientation.w)
+  };
+  if (![q.x, q.y, q.z, q.w].every(Number.isFinite)) return null;
+
+  // Head-local -Z is visual forward in WebXR. Flatten to X/Z so pitch/roll do
+  // not make locomotion flip or become unstable when looking up/down.
+  const rawForward = rotateVecByQuat(q, { x: 0, y: 0, z: -1 });
+  let forward = normalizeXZ(rawForward.x, rawForward.z);
+  if (!forward) return null;
+
+  // Rebuild right from forward on the flat ground plane. This is intentionally
+  // not the head-local +X vector, because roll should never affect walking.
+  const right = { x: -forward.z, z: forward.x };
+  return {
+    forward,
+    right,
+    yaw: Math.atan2(forward.x, -forward.z)
+  };
+}
+
+function poseToPayload(pose) {
+  if (!pose) return null;
+  const t = pose.transform;
+  const orientation = { x: t.orientation.x, y: t.orientation.y, z: t.orientation.z, w: t.orientation.w };
+  const heading = flatHeadingFromOrientation(orientation);
+  return {
+    position: { x: t.position.x, y: t.position.y, z: t.position.z },
+    orientation,
+    matrix: Array.from(t.matrix),
+    flatForward: heading ? heading.forward : null,
+    flatRight: heading ? heading.right : null,
+    headingYaw: heading ? heading.yaw : null
+  };
+}
+
+function buttonPayload(buttons, i) {
+  const b = buttons && buttons[i];
+  return b ? { pressed: b.pressed, touched: b.touched, value: b.value } : { pressed: false, touched: false, value: 0 };
+}
+
+function inputPayload(frame) {
+  const out = [];
+  const summaries = [];
+  for (const src of xrSession.inputSources) {
+    const gripPose = src.gripSpace ? frame.getPose(src.gripSpace, refSpace) : null;
+    const rayPose = src.targetRaySpace ? frame.getPose(src.targetRaySpace, refSpace) : null;
+    const gp = src.gamepad;
+    const buttons = gp ? Array.from(gp.buttons || []) : [];
+    const axes = gp ? Array.from(gp.axes || []) : [];
+
+    const semantic = {
+      trigger: buttonPayload(buttons, 0),
+      grip: buttonPayload(buttons, 1),
+      thumbstick: buttonPayload(buttons, 3),
+      primary: buttonPayload(buttons, 4),
+      secondary: buttonPayload(buttons, 5),
+      // Quest Browser may expose stick as axes[2]/[3], but some runtimes use [0]/[1].
+      thumbstickX: axes[2] ?? axes[0] ?? 0,
+      thumbstickY: axes[3] ?? axes[1] ?? 0
+    };
+
+    out.push({
+      handedness: src.handedness,
+      targetRayMode: src.targetRayMode,
+      profiles: src.profiles || [],
+      grip: poseToPayload(gripPose),
+      ray: poseToPayload(rayPose),
+      gamepad: gp ? {
+        id: gp.id || "",
+        mapping: gp.mapping || "",
+        axes,
+        buttons: buttons.map(b => ({ pressed: b.pressed, touched: b.touched, value: b.value })),
+        semantic
+      } : null
+    });
+
+    summaries.push(`${src.handedness || "?"}: T${semantic.trigger.value.toFixed(2)} G${semantic.grip.value.toFixed(2)} P${semantic.primary.pressed ? "1" : "0"} S${semantic.secondary.pressed ? "1" : "0"} stick(${semantic.thumbstickX.toFixed(1)},${semantic.thumbstickY.toFixed(1)})`);
+  }
+  controllerStatus.textContent = `controllers: ${summaries.join(" | ") || "none"}`;
+  return out;
+}
+
+function sendTracking(frame, viewerPose, xrTime) {
+  if (!ws || ws.readyState !== WebSocket.OPEN || !viewerPose) return;
+  const views = [];
+  for (const view of viewerPose.views) {
+    views.push({ eye: view.eye, projectionMatrix: Array.from(view.projectionMatrix), viewMatrix: Array.from(view.transform.inverse.matrix) });
+  }
+  ws.send(JSON.stringify({
+    type: "tracking",
+    clientTimeMs: performance.timeOrigin + performance.now(),
+    xrTime,
+    viewer: {
+      views: viewerPose.views.map(v => v.eye),
+      pose: poseToPayload(viewerPose)
+    },
+    views,
+    inputs: inputPayload(frame),
+    events: queuedInputEvents.splice(0, queuedInputEvents.length)
+  }));
+  trackingPackets++;
+  trackingEl.textContent = `tracking: ${trackingPackets}`;
+}
+
+function m4Identity() { return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]); }
+function m4Multiply(a, b) {
+  const out = new Float32Array(16);
+  for (let col = 0; col < 4; col++) for (let row = 0; row < 4; row++) {
+    out[col * 4 + row] =
+      a[0 * 4 + row] * b[col * 4 + 0] +
+      a[1 * 4 + row] * b[col * 4 + 1] +
+      a[2 * 4 + row] * b[col * 4 + 2] +
+      a[3 * 4 + row] * b[col * 4 + 3];
+  }
+  return out;
+}
+
+function m4Invert(a) {
+  const out = new Float32Array(16);
+  const a00=a[0],a01=a[1],a02=a[2],a03=a[3],a10=a[4],a11=a[5],a12=a[6],a13=a[7],a20=a[8],a21=a[9],a22=a[10],a23=a[11],a30=a[12],a31=a[13],a32=a[14],a33=a[15];
+  const b00=a00*a11-a01*a10,b01=a00*a12-a02*a10,b02=a00*a13-a03*a10,b03=a01*a12-a02*a11,b04=a01*a13-a03*a11,b05=a02*a13-a03*a12,b06=a20*a31-a21*a30,b07=a20*a32-a22*a30,b08=a20*a33-a23*a30,b09=a21*a32-a22*a31,b10=a21*a33-a23*a31,b11=a22*a33-a23*a32;
+  let det=b00*b11-b01*b10+b02*b09+b03*b08-b04*b07+b05*b06;
+  if (!det) return null;
+  det=1/det;
+  out[0]=(a11*b11-a12*b10+a13*b09)*det; out[1]=(a02*b10-a01*b11-a03*b09)*det; out[2]=(a31*b05-a32*b04+a33*b03)*det; out[3]=(a22*b04-a21*b05-a23*b03)*det;
+  out[4]=(a12*b08-a10*b11-a13*b07)*det; out[5]=(a00*b11-a02*b08+a03*b07)*det; out[6]=(a32*b02-a30*b05-a33*b01)*det; out[7]=(a20*b05-a22*b02+a23*b01)*det;
+  out[8]=(a10*b10-a11*b08+a13*b06)*det; out[9]=(a01*b08-a00*b10-a03*b06)*det; out[10]=(a30*b04-a31*b02+a33*b00)*det; out[11]=(a21*b02-a20*b04-a23*b00)*det;
+  out[12]=(a11*b07-a10*b09-a12*b06)*det; out[13]=(a00*b09-a01*b07+a02*b06)*det; out[14]=(a31*b01-a30*b03-a32*b00)*det; out[15]=(a20*b03-a21*b01+a22*b00)*det;
+  return out;
+}
+
+function getReprojectionMatrix(view) {
+  if (!reprojectionEnabled || !activeFrameMeta || !activeFrameMeta.renderViews) return m4Identity();
+  const eye = view.eye === "right" ? "right" : "left";
+  const old = activeFrameMeta.renderViews[eye];
+  if (!old || !old.viewProjection) return m4Identity();
+  const currentVP = m4Multiply(view.projectionMatrix, view.transform.inverse.matrix);
+  const currentVPInv = m4Invert(currentVP);
+  if (!currentVPInv) return m4Identity();
+  return m4Multiply(new Float32Array(old.viewProjection), currentVPInv);
+}
+
+function drawEye(view, eyeIndex) {
+  const layer = xrSession.renderState.baseLayer;
+  const vp = layer.getViewport(view);
+  gl.viewport(vp.x, vp.y, vp.width, vp.height);
+
+  if (textureDirty && latestBitmap) {
+    gl.bindTexture(gl.TEXTURE_2D, streamTex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    try {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, latestBitmap);
+      latestBitmap.close?.();
+      latestBitmap = null;
+      textureDirty = false;
+      if (pendingUploadMeta) {
+        const uploadedMeta = pendingUploadMeta;
+        const uploadedDecodeMs = pendingUploadDecodeMs;
+        activeFrameMeta = uploadedMeta;
+        lastAcceptedStreamSeq = Math.max(lastAcceptedStreamSeq, frameId(uploadedMeta));
+        acceptedFrames++;
+        lastTextureUploadAt = performance.now();
+        lastGoodFrameAt = lastTextureUploadAt;
+        sendFrameAck(uploadedMeta, true, {
+          decodeMs: uploadedDecodeMs,
+          uploadMs: 0,
+          ageMs: correctedServerAgeMs(uploadedMeta) ?? 0,
+          localAgeMs: uploadedMeta._clientMetaReceivedAt ? Math.max(0, performance.now() - uploadedMeta._clientMetaReceivedAt) : 0,
+          droppedClientFrames: clientDroppedFrames,
+          acceptedFrames,
+          displayed: true
+        });
+      } else {
+        lastTextureUploadAt = performance.now();
+        lastGoodFrameAt = lastTextureUploadAt;
+      }
+      pendingUploadMeta = null;
+      pendingUploadDecodeMs = 0;
+      concealUntil = Math.max(concealUntil, lastTextureUploadAt + 30);
+      if (pendingVideo && !decodeBusy) setTimeout(processVideoQueue, 0);
+    } catch (e) {
+      const failedMeta = pendingUploadMeta;
+      try { latestBitmap?.close?.(); } catch (_) {}
+      latestBitmap = null;
+      textureDirty = false;
+      pendingUploadMeta = null;
+      pendingUploadDecodeMs = 0;
+      markDroppedFrame("texture upload failed - holding previous texture");
+      if (failedMeta) {
+        sendFrameAck(failedMeta, false, {
+          reason: "texture-upload",
+          message: String(e && e.message || e),
+          droppedClientFrames: clientDroppedFrames
+        });
+      }
+      // Do not resync/reconnect on texture upload failure. The existing GL texture
+      // remains the last valid ground truth; the next valid decoded frame can try again.
+      if (pendingVideo && !decodeBusy) setTimeout(processVideoQueue, 0);
+    }
+  }
+
+  gl.useProgram(program);
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+
+  const aPos = gl.getAttribLocation(program, "a_pos");
+  const aUv = gl.getAttribLocation(program, "a_uv");
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 16, 0);
+  gl.enableVertexAttribArray(aUv);
+  gl.vertexAttribPointer(aUv, 2, gl.FLOAT, false, 16, 8);
+
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, streamTex);
+  gl.uniform1i(gl.getUniformLocation(program, "u_tex"), 0);
+  gl.uniform1f(gl.getUniformLocation(program, "u_eye"), eyeIndex);
+  gl.uniform1f(gl.getUniformLocation(program, "u_reproject"), reprojectionEnabled && activeFrameMeta ? 1.0 : 0.0);
+  gl.uniformMatrix4fv(gl.getUniformLocation(program, "u_reproject_matrix"), false, getReprojectionMatrix(view));
+
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+function onXRFrame(xrTime, frame) {
+  xrSession.requestAnimationFrame(onXRFrame);
+  const pose = frame.getViewerPose(refSpace);
+  if (!pose) return;
+  sendTracking(frame, pose, xrTime);
+
+  const layer = xrSession.renderState.baseLayer;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+  gl.disable(gl.DEPTH_TEST);
+  gl.clearColor(0.06, 0.065, 0.08, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  for (const view of pose.views) drawEye(view, view.eye === "right" ? 1.0 : 0.0);
+}
+
+setInterval(() => {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (receivedFrames < 2) return;
+  const stallMs = performance.now() - lastGoodFrameAt;
+  if (stallMs > WATCHDOG_STALL_MS) {
+    requestStreamResync(`watchdog-stall-${stallMs.toFixed(0)}ms`, false);
+  }
+}, 300);
+</script>
+</body>
+</html>
