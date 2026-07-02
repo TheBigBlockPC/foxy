@@ -133,6 +133,15 @@ function log(msg) {
 
 let ws = null;
 let wsGeneration = 0;
+let rtcPc = null;
+let rtcVideoChannel = null;
+let rtcGeneration = 0;
+let preferredVideoTransport = "websocket";
+let videoTransportActive = "websocket";
+const rtcTextDecoder = new TextDecoder();
+const RTC_VIDEO_MAGIC = 0x46585631; // "FXV1"
+const RTC_VIDEO_HEADER_BYTES = 14;
+let rtcFrameChunks = new Map();
 let nextFrameMeta = null;
 let activeFrameMeta = null;
 let pendingBinaryType = null;
@@ -176,6 +185,7 @@ const MAX_CLIENT_FRAME_AGE_MS = Number(qs.get("maxAgeMs") || 240);
 const MAX_LOCAL_QUEUE_MS = Number(qs.get("maxLocalQueueMs") || 350);
 const WATCHDOG_STALL_MS = Number(qs.get("watchdogMs") || 1800);
 const MAX_CONSECUTIVE_DECODE_ERRORS = Number(qs.get("maxDecodeErrors") || 8);
+const RTC_CHUNK_STALE_MS = Number(qs.get("rtcChunkStaleMs") || 450);
 
 function setStreamStatus(text, cls = "") {
   streamStatus.textContent = text;
@@ -201,6 +211,211 @@ function sendFrameAck(meta, ok, extra = {}) {
     clientTimeMs: performance.timeOrigin + performance.now(),
     ...extra
   });
+}
+
+function handleFrameMeta(msg) {
+  if (msg.serverTimeMs) {
+    const roughOffset = performance.timeOrigin + performance.now() - Number(msg.serverTimeMs);
+    serverClockOffsetMs = serverClockOffsetMs === null ? roughOffset : (serverClockOffsetMs * 0.98 + roughOffset * 0.02);
+  }
+  msg._clientMetaReceivedAt = performance.now();
+  if (nextFrameMeta) {
+    clientDroppedFrames++;
+    markDroppedFrame("metadata superseded");
+    sendFrameAck(nextFrameMeta, false, { reason: "metadata-superseded", droppedClientFrames: clientDroppedFrames });
+  }
+  nextFrameMeta = msg;
+  latestEyeWidth = msg.eyeWidth || latestEyeWidth;
+  latestEyeHeight = msg.eyeHeight || latestEyeHeight;
+  if (msg.mode) modeStatus.textContent = `mode: ${msg.mode}${msg.appName ? " / " + msg.appName : ""}`;
+  if (msg.transport) videoTransportActive = msg.transport;
+}
+
+function handleFrameBinary(data) {
+  receivedFrames++;
+  fpsEl.textContent = `frames: ${acceptedFrames}/${receivedFrames} | dropped: ${clientDroppedFrames}`;
+  const blob = data instanceof Blob ? data : new Blob([data], { type: "image/jpeg" });
+  queueVideoFrame(blob);
+}
+
+function pruneRTCFrameChunks() {
+  const now = performance.now();
+  for (const [seq, item] of rtcFrameChunks) {
+    if (now - item.startedAt > RTC_CHUNK_STALE_MS || rtcFrameChunks.size > 6) {
+      rtcFrameChunks.delete(seq);
+      clientDroppedFrames++;
+      markDroppedFrame("incomplete UDP frame");
+    }
+  }
+}
+
+function handleCompleteRTCFrame(item) {
+  const payload = new Uint8Array(item.bytes);
+  let offset = 0;
+  for (const chunk of item.chunks) {
+    payload.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  handleFrameMeta(item.meta);
+  handleFrameBinary(payload);
+}
+
+function handleRTCVideoPacket(data) {
+  const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer || data);
+  if (bytes.byteLength < RTC_VIDEO_HEADER_BYTES) {
+    clientDroppedFrames++;
+    markDroppedFrame("short UDP video packet");
+    return;
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (view.getUint32(0, false) !== RTC_VIDEO_MAGIC) {
+    clientDroppedFrames++;
+    markDroppedFrame("bad UDP video magic");
+    return;
+  }
+  const seq = view.getUint32(4, false);
+  const index = view.getUint16(8, false);
+  const count = view.getUint16(10, false);
+  const metaLen = view.getUint16(12, false);
+  if (count <= 0 || index >= count || metaLen > bytes.byteLength - RTC_VIDEO_HEADER_BYTES) {
+    clientDroppedFrames++;
+    markDroppedFrame("bad UDP video chunk");
+    return;
+  }
+  const metaStart = RTC_VIDEO_HEADER_BYTES;
+  const payloadStart = metaStart + metaLen;
+  let item = rtcFrameChunks.get(seq);
+  if (!item || item.count !== count) {
+    item = {
+      count,
+      chunks: new Array(count),
+      received: 0,
+      bytes: 0,
+      meta: null,
+      startedAt: performance.now()
+    };
+    rtcFrameChunks.set(seq, item);
+  }
+  if (metaLen > 0) {
+    const meta = JSON.parse(rtcTextDecoder.decode(bytes.subarray(metaStart, payloadStart)));
+    if (meta.type !== "frame-meta") {
+      clientDroppedFrames++;
+      markDroppedFrame("bad UDP video metadata");
+      rtcFrameChunks.delete(seq);
+      return;
+    }
+    item.meta = meta;
+  }
+  if (!item.chunks[index]) {
+    const chunk = bytes.slice(payloadStart);
+    item.chunks[index] = chunk;
+    item.received++;
+    item.bytes += chunk.byteLength;
+  }
+  if (item.received === item.count && item.meta) {
+    rtcFrameChunks.delete(seq);
+    handleCompleteRTCFrame(item);
+  } else {
+    pruneRTCFrameChunks();
+  }
+}
+
+function resetWebRTCVideo() {
+  rtcGeneration++;
+  const oldChannel = rtcVideoChannel;
+  const oldPc = rtcPc;
+  rtcVideoChannel = null;
+  rtcPc = null;
+  rtcFrameChunks.clear();
+  videoTransportActive = "websocket";
+  if (oldChannel) {
+    try { oldChannel.close(); } catch (e) {}
+  }
+  if (oldPc) {
+    try { oldPc.close(); } catch (e) {}
+  }
+}
+
+function waitForIceGatheringComplete(pc) {
+  if (pc.iceGatheringState === "complete") return Promise.resolve();
+  return new Promise(resolve => {
+    const done = () => {
+      if (pc.iceGatheringState === "complete") {
+        pc.removeEventListener("icegatheringstatechange", done);
+        resolve();
+      }
+    };
+    pc.addEventListener("icegatheringstatechange", done);
+    setTimeout(() => {
+      pc.removeEventListener("icegatheringstatechange", done);
+      resolve();
+    }, 2000);
+  });
+}
+
+async function startWebRTCVideo(generation) {
+  if (!window.RTCPeerConnection) {
+    log("WebRTC DataChannel unavailable; staying on WebSocket video.");
+    sendJSON({ type: "webrtc-client-unavailable", reason: "RTCPeerConnection missing" });
+    return;
+  }
+  resetWebRTCVideo();
+  const localRtcGeneration = ++rtcGeneration;
+  const pc = new RTCPeerConnection({ iceServers: [] });
+  rtcPc = pc;
+  const channel = pc.createDataChannel("foxy-video", { ordered: false, maxRetransmits: 0 });
+  channel.binaryType = "arraybuffer";
+  rtcVideoChannel = channel;
+
+  channel.onopen = () => {
+    if (generation !== wsGeneration || localRtcGeneration !== rtcGeneration) return;
+    videoTransportActive = "webrtc-datachannel";
+    setStreamStatus("stream: UDP video ready", "good");
+    log("WebRTC DataChannel video ready.");
+  };
+  channel.onclose = () => {
+    if (localRtcGeneration !== rtcGeneration) return;
+    videoTransportActive = "websocket";
+    setStreamStatus("stream: UDP video closed", "warn");
+    sendJSON({ type: "webrtc-client-unavailable", reason: "data channel closed" });
+    log("WebRTC DataChannel video closed.");
+  };
+  channel.onerror = () => {
+    if (localRtcGeneration !== rtcGeneration) return;
+    setStreamStatus("stream: UDP video error", "warn");
+    sendJSON({ type: "webrtc-client-unavailable", reason: "data channel error" });
+    log("WebRTC DataChannel video error.");
+  };
+  channel.onmessage = (ev) => {
+    if (generation !== wsGeneration || localRtcGeneration !== rtcGeneration) return;
+    if (typeof ev.data === "string") {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === "frame-meta") handleFrameMeta(msg);
+      return;
+    }
+    if (ev.data instanceof Blob) {
+      ev.data.arrayBuffer().then(handleRTCVideoPacket).catch(e => log("UDP video packet read failed: " + e.message));
+    } else {
+      handleRTCVideoPacket(ev.data);
+    }
+  };
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await waitForIceGatheringComplete(pc);
+  if (generation !== wsGeneration || localRtcGeneration !== rtcGeneration) return;
+  sendJSON({
+    type: "webrtc-offer",
+    sdpType: pc.localDescription.type,
+    sdp: pc.localDescription.sdp,
+    clientTimeMs: performance.timeOrigin + performance.now()
+  });
+  setStreamStatus("stream: UDP video negotiating", "warn");
+}
+
+async function acceptWebRTCAnswer(msg) {
+  if (!rtcPc) return;
+  await rtcPc.setRemoteDescription({ type: msg.sdpType || "answer", sdp: msg.sdp });
 }
 
 function correctedServerAgeMs(meta) {
@@ -420,6 +635,7 @@ async function processVideoQueue() {
 }
 
 function connect() {
+  resetWebRTCVideo();
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
     try { ws.close(1000, "client-reconnect"); } catch (e) { try { ws.close(); } catch (_) {} }
   }
@@ -444,6 +660,7 @@ function connect() {
 
   ws.onclose = () => {
     if (generation !== wsGeneration) return;
+    resetWebRTCVideo();
     wsStatus.textContent = "WS: closed";
     setStreamStatus("stream: disconnected", "bad");
     log("WebSocket closed.");
@@ -464,24 +681,24 @@ function connect() {
         latestEyeWidth = msg.eyeWidth || latestEyeWidth;
         latestEyeHeight = msg.eyeHeight || latestEyeHeight;
         if (msg.serverTimeMs) serverClockOffsetMs = performance.timeOrigin + performance.now() - Number(msg.serverTimeMs);
-        log(`${msg.message}. Server eye frame: ${latestEyeWidth}x${latestEyeHeight}, fps target: ${msg.fps}`);
+        preferredVideoTransport = msg.videoTransport || "websocket";
+        log(`${msg.message}. Server eye frame: ${latestEyeWidth}x${latestEyeHeight}, fps target: ${msg.fps}, video: ${preferredVideoTransport}`);
+        if (preferredVideoTransport === "webrtc-datachannel") {
+          startWebRTCVideo(generation).catch(e => {
+            log("WebRTC video setup failed: " + e.message);
+            sendJSON({ type: "webrtc-client-unavailable", reason: String(e && e.message || e) });
+          });
+        }
       } else if (msg.type === "frame-meta") {
-        if (msg.serverTimeMs) {
-          const roughOffset = performance.timeOrigin + performance.now() - Number(msg.serverTimeMs);
-          serverClockOffsetMs = serverClockOffsetMs === null ? roughOffset : (serverClockOffsetMs * 0.98 + roughOffset * 0.02);
-        }
-        msg._clientMetaReceivedAt = performance.now();
-        if (nextFrameMeta) {
-          clientDroppedFrames++;
-          markDroppedFrame("metadata superseded");
-          sendFrameAck(nextFrameMeta, false, { reason: "metadata-superseded", droppedClientFrames: clientDroppedFrames });
-        }
-        nextFrameMeta = msg;
-        latestEyeWidth = msg.eyeWidth || latestEyeWidth;
-        latestEyeHeight = msg.eyeHeight || latestEyeHeight;
-        if (msg.mode) modeStatus.textContent = `mode: ${msg.mode}${msg.appName ? " / " + msg.appName : ""}`;
+        handleFrameMeta(msg);
       } else if (msg.type === "audio-meta") {
         pendingBinaryType = msg;
+      } else if (msg.type === "webrtc-answer") {
+        acceptWebRTCAnswer(msg).catch(e => log("WebRTC answer failed: " + e.message));
+      } else if (msg.type === "webrtc-unavailable") {
+        preferredVideoTransport = "websocket";
+        resetWebRTCVideo();
+        log("WebRTC video unavailable on server; using WebSocket video.");
       } else if (msg.type === "stream-resync") {
         lastSeenStreamEpoch = msg.streamEpoch || lastSeenStreamEpoch || 0;
         // Server-side resync invalidates queued state only. Keep the last good
@@ -513,9 +730,7 @@ function connect() {
       return;
     }
 
-    receivedFrames++;
-    fpsEl.textContent = `frames: ${acceptedFrames}/${receivedFrames} | dropped: ${clientDroppedFrames}`;
-    queueVideoFrame(ev.data);
+    handleFrameBinary(ev.data);
   };
 }
 
@@ -533,6 +748,7 @@ document.querySelector("#toggleReprojection").onclick = () => {
 connect();
 
 window.addEventListener("pagehide", () => {
+  resetWebRTCVideo();
   if (ws && ws.readyState === WebSocket.OPEN) {
     try { ws.close(1000, "pagehide"); } catch (e) {}
   }

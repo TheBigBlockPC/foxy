@@ -11,7 +11,7 @@ It gives you:
 - An OpenGL demo experience showing stick movement, A/B/X/Y-style buttons, triggers, grips, and stereo rendering.
 - A desktop preview panel in the hub when desktop capture is available.
 
-This is still a prototype transport: JPEG over WebSocket. It is meant to prove the architecture. For production, replace the frame transport with WebRTC + hardware AV1/H.265/H.264.
+This is still a prototype transport: JPEG frames over WebSocket. It is meant to prove the architecture. For production, replace the frame transport with WebRTC + hardware AV1/H.265/H.264.
 
 ## Quick start
 
@@ -144,6 +144,13 @@ The helper tries 5 GHz first and falls back to 2.4 GHz if the Wi-Fi card or
 regulatory domain does not allow 5 GHz AP mode. When Foxy exits, it stops the
 hotspot and restores the interface. The helper uses `hostapd`, `dnsmasq`, and
 root privileges; if Foxy is not already root it starts the helper through `sudo`.
+
+Hotspot mode uses the same WebSocket/TCP video path as regular Wi-Fi mode by
+default, because the experimental WebRTC DataChannel/UDP path was less stable on
+Quest Browser with JPEG chunks. You can still compare it explicitly with
+`--hotspot-udp-video` after installing `aiortc`; if it is unstable, try
+`--webrtc-chunk-bytes 8000` or lower. USB ADB reverse mode stays on WebSocket/TCP
+because adb reverse cannot forward UDP.
 
 The v0 SSID default is `foxy`. The requested password `foxy` is kept as the CLI
 default, but WPA/WPA2 requires 8 to 63 characters, so Linux AP tooling rejects

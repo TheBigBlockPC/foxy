@@ -25,6 +25,15 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 try:
+    from aiortc import RTCPeerConnection, RTCSessionDescription
+except Exception as e:
+    RTCPeerConnection = None
+    RTCSessionDescription = None
+    AIORTC_IMPORT_ERROR = e
+else:
+    AIORTC_IMPORT_ERROR = None
+
+try:
     import moderngl
 except Exception as e:
     moderngl = None
@@ -43,6 +52,7 @@ WEB_ROOT = ROOT / "web"
 DEFAULT_IPC_PATH = os.environ.get("FOXY_IPC", "/tmp/foxy_ipc.sock")
 DEFAULT_HOTSPOT_DOMAIN = "foxy.local"
 DEFAULT_HOTSPOT_ADDRESS = "10.42.0.1"
+RTC_VIDEO_MAGIC = b"FXV1"
 
 
 def now_ms() -> float:
@@ -888,6 +898,9 @@ class FoxyServer:
         self.clients: set[web.WebSocketResponse] = set()
         self.client_health: Dict[web.WebSocketResponse, Dict[str, Any]] = {}
         self.client_locks: Dict[web.WebSocketResponse, asyncio.Lock] = {}
+        self.rtc_peers: Dict[web.WebSocketResponse, Any] = {}
+        self.rtc_video_channels: Dict[web.WebSocketResponse, Any] = {}
+        self.ws_video_fallback: set[web.WebSocketResponse] = set()
         self.stream_seq = 0
         self.stream_epoch = 0
         self.renderer: Optional[HubRenderer] = None
@@ -917,7 +930,18 @@ class FoxyServer:
             "mic_chunks_served_ipc": 0,
             "last_controller_summary": "",
             "ipc_clients": 0,
+            "video_transport": self.video_transport_name(),
         }
+
+    def webrtc_video_enabled(self) -> bool:
+        return (
+            bool(getattr(self.args, "hotspot", False))
+            and bool(getattr(self.args, "hotspot_udp_video", False))
+            and RTCPeerConnection is not None
+        )
+
+    def video_transport_name(self) -> str:
+        return "webrtc-datachannel" if self.webrtc_video_enabled() else "websocket"
 
     async def init_renderer(self) -> None:
         self.renderer = await asyncio.to_thread(HubRenderer, self.args.eye_width, self.args.eye_height, not self.args.no_desktop)
@@ -947,6 +971,8 @@ class FoxyServer:
             "eyeHeight": self.args.eye_height,
             "fps": self.args.fps,
             "ipcPath": self.args.ipc_path,
+            "videoTransport": self.video_transport_name(),
+            "webrtcAvailable": RTCPeerConnection is not None,
             "hotspot": {
                 "enabled": bool(getattr(self.args, "hotspot", False)),
                 "ssid": getattr(self.args, "hotspot_ssid", "foxy"),
@@ -997,6 +1023,8 @@ class FoxyServer:
             "eyeHeight": self.args.eye_height,
             "fps": self.args.fps,
             "message": "Connected to Foxy SDK server",
+            "videoTransport": self.video_transport_name(),
+            "webrtcAvailable": RTCPeerConnection is not None,
         })
 
         try:
@@ -1073,6 +1101,11 @@ class FoxyServer:
                         await ws.send_json({"type": "reset-ok", "serverTimeMs": now_ms()})
                     elif typ == "ping":
                         await ws.send_json({"type": "pong", "serverTimeMs": now_ms(), "clientTimeMs": payload.get("clientTimeMs")})
+                    elif typ == "webrtc-offer":
+                        await self.handle_webrtc_offer(ws, payload)
+                    elif typ == "webrtc-client-unavailable":
+                        self.ws_video_fallback.add(ws)
+                        log(f"Client cannot use WebRTC video, falling back to WebSocket: {peer}")
                 elif msg.type == aiohttp.WSMsgType.BINARY:
                     if self.pending_binary and self.pending_binary.get("type") == "mic-meta":
                         mic_payload = bytes(msg.data)
@@ -1087,9 +1120,58 @@ class FoxyServer:
             self.clients.discard(ws)
             self.client_health.pop(ws, None)
             self.client_locks.pop(ws, None)
+            self.ws_video_fallback.discard(ws)
+            await self.close_webrtc(ws)
             self.stats["clients"] = len(self.clients)
             log(f"Quest/client disconnected: {peer}")
         return ws
+
+    async def handle_webrtc_offer(self, ws: web.WebSocketResponse, payload: Dict[str, Any]) -> None:
+        if not self.webrtc_video_enabled() or RTCPeerConnection is None or RTCSessionDescription is None:
+            await self.send_json_locked(ws, {
+                "type": "webrtc-unavailable",
+                "reason": "hotspot mode requires aiortc for UDP video transport",
+                "videoTransport": "websocket",
+            })
+            return
+
+        await self.close_webrtc(ws)
+        self.ws_video_fallback.discard(ws)
+        pc = RTCPeerConnection()
+        self.rtc_peers[ws] = pc
+
+        @pc.on("datachannel")
+        def on_datachannel(channel):
+            log(f"WebRTC data channel opened by client: {channel.label}")
+            if channel.label != "foxy-video":
+                return
+            self.rtc_video_channels[ws] = channel
+
+            @channel.on("close")
+            def on_close():
+                if self.rtc_video_channels.get(ws) is channel:
+                    self.rtc_video_channels.pop(ws, None)
+                log("WebRTC video data channel closed")
+
+        desc = RTCSessionDescription(sdp=str(payload.get("sdp") or ""), type=str(payload.get("sdpType") or "offer"))
+        await pc.setRemoteDescription(desc)
+        answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+        await self.send_json_locked(ws, {
+            "type": "webrtc-answer",
+            "sdpType": pc.localDescription.type,
+            "sdp": pc.localDescription.sdp,
+            "videoTransport": "webrtc-datachannel",
+        })
+
+    async def close_webrtc(self, ws: web.WebSocketResponse) -> None:
+        self.rtc_video_channels.pop(ws, None)
+        pc = self.rtc_peers.pop(ws, None)
+        if pc is not None:
+            try:
+                await pc.close()
+            except Exception:
+                pass
 
     async def handle_ipc(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername") or "ipc-client"
@@ -1221,6 +1303,66 @@ class FoxyServer:
             await ws.send_json(meta)
             await ws.send_bytes(payload)
 
+    def build_rtc_video_packets(self, meta: Dict[str, Any], payload: bytes) -> List[bytes]:
+        meta_bytes = json.dumps(meta, separators=(",", ":")).encode("utf-8")
+        if len(meta_bytes) > 65535:
+            raise RuntimeError("WebRTC video metadata is unexpectedly large")
+        chunk_size = max(1200, int(self.args.webrtc_chunk_bytes))
+        chunks = [payload[i:i + chunk_size] for i in range(0, len(payload), chunk_size)] or [b""]
+        if len(chunks) > 65535:
+            raise RuntimeError("WebRTC video frame needs too many chunks")
+        packets = []
+        seq = int(meta.get("streamSeq") or 0)
+        count = len(chunks)
+        for index, chunk in enumerate(chunks):
+            header_meta = meta_bytes if index == 0 else b""
+            packets.append(
+                RTC_VIDEO_MAGIC
+                + struct.pack("!IHHH", seq, index, count, len(header_meta))
+                + header_meta
+                + chunk
+            )
+        return packets
+
+    async def send_video_frame(self, ws: web.WebSocketResponse, meta: Dict[str, Any], payload: bytes) -> bool:
+        channel = self.rtc_video_channels.get(ws)
+        if ws not in self.ws_video_fallback and channel is not None and getattr(channel, "readyState", "") == "open":
+            buffered = int(getattr(channel, "bufferedAmount", 0) or 0)
+            if buffered > self.args.webrtc_buffered_drop_bytes:
+                health = self.client_health.get(ws)
+                if health is not None:
+                    health["server_drops"] = int(health.get("server_drops", 0)) + 1
+                    health["state"] = "webrtc-buffered-drop"
+                self.stats["frames_dropped_server"] += 1
+                return False
+            meta = dict(meta)
+            meta["transport"] = "webrtc-datachannel"
+            overflowed = False
+            for packet in self.build_rtc_video_packets(meta, payload):
+                channel.send(packet)
+                if int(getattr(channel, "bufferedAmount", 0) or 0) > self.args.webrtc_buffered_drop_bytes:
+                    overflowed = True
+                    break
+            if overflowed:
+                health = self.client_health.get(ws)
+                if health is not None:
+                    health["server_drops"] = int(health.get("server_drops", 0)) + 1
+                    health["state"] = "webrtc-mid-frame-drop"
+                self.stats["frames_dropped_server"] += 1
+                return False
+            return True
+
+        if self.webrtc_video_enabled() and ws not in self.ws_video_fallback:
+            health = self.client_health.get(ws)
+            if health is not None:
+                health["state"] = "waiting-for-webrtc-video"
+            return False
+
+        meta = dict(meta)
+        meta["transport"] = "websocket"
+        await self.send_binary_pair_locked(ws, meta, payload)
+        return True
+
     async def force_resync(self, ws: web.WebSocketResponse, reason: str) -> None:
         """Tell one client to throw away all pending stream state and wait for a new full frame.
 
@@ -1336,9 +1478,10 @@ class FoxyServer:
                             health = self.client_health.get(ws, {})
                             per_client_meta["serverDroppedFrames"] = int(health.get("server_drops", 0) or 0)
                             per_client_meta["serverSkippedNotReady"] = int(health.get("server_blocked_ticks", 0) or 0)
-                            await self.send_binary_pair_locked(ws, per_client_meta, jpeg)
-                            sent += 1
-                            if ws in self.client_health:
+                            frame_sent = await self.send_video_frame(ws, per_client_meta, jpeg)
+                            if frame_sent:
+                                sent += 1
+                            if frame_sent and ws in self.client_health:
                                 self.client_health[ws]["last_sent_seq"] = self.stream_seq
                                 self.client_health[ws]["last_sent_ms"] = now_ms()
                                 self.client_health[ws]["state"] = "sent"
@@ -1515,6 +1658,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hotspot-interface", default="", help="Wi-Fi interface to use for --hotspot; autodetected when omitted")
     p.add_argument("--hotspot-country", default=os.environ.get("FOXY_HOTSPOT_COUNTRY", ""), help="Optional two-letter regulatory country for hostapd")
     p.add_argument("--hotspot-no-sudo", action="store_true", help="Do not auto-run the hotspot helper through sudo when not root")
+    p.add_argument("--hotspot-udp-video", action="store_true", help="Experimental: send hotspot video over WebRTC DataChannel/UDP instead of WebSocket/TCP")
+    p.add_argument("--webrtc-buffered-drop-bytes", type=int, default=2_000_000, help="Drop UDP/WebRTC video frames when the data channel has this many queued bytes")
+    p.add_argument("--webrtc-chunk-bytes", type=int, default=16_000, help="WebRTC DataChannel video chunk size; smaller chunks avoid large SCTP message stalls")
     return p.parse_args()
 
 
@@ -1537,6 +1683,12 @@ def main() -> None:
     log(f"IPC: {args.ipc_path}")
     if args.hotspot:
         log(f"Hotspot mode: SSID={args.hotspot_ssid!r}, URL=https://{args.hotspot_domain}:{args.port}")
+        if not args.hotspot_udp_video:
+            log("Hotspot video transport: WebSocket/TCP (stable default)")
+        elif RTCPeerConnection is None:
+            log(f"Warning: aiortc unavailable ({AIORTC_IMPORT_ERROR}); hotspot video will fall back to WebSocket/TCP")
+        else:
+            log("Hotspot video transport: WebRTC DataChannel over UDP (experimental)")
     elif args.host == "127.0.0.1" and not args.tls:
         log("Quest USB mode: run scripts/adb-localhost.sh and open http://localhost:PORT in Quest Browser")
     elif not args.tls:
