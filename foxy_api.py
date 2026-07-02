@@ -347,6 +347,59 @@ class FoxyClient:
             header["reprojection"] = "client-rotational-timewarp-v1"
         _send_packet(sock, header, jpeg_sbs)
 
+    def send_audio_pcm(
+        self,
+        pcm_s16le: bytes,
+        *,
+        sample_rate: int = 48000,
+        channels: int = 2,
+        samples_per_channel: Optional[int] = None,
+        app_name: str = "foxy-experience",
+    ) -> None:
+        """Send signed 16-bit little-endian PCM audio to the Quest browser.
+
+        The browser page must have audio unlocked first by pressing Enable Audio.
+        Keep chunks small, typically 20-60 ms. For stereo data, samples must be
+        interleaved left/right.
+        """
+        if sample_rate <= 0:
+            raise ValueError("sample_rate must be positive")
+        if channels <= 0:
+            raise ValueError("channels must be positive")
+        frame_bytes = 2 * int(channels)
+        if len(pcm_s16le) % frame_bytes != 0:
+            raise ValueError("pcm_s16le length must align to 16-bit interleaved channels")
+        if samples_per_channel is None:
+            samples_per_channel = len(pcm_s16le) // frame_bytes
+
+        sock = self._require()
+        _send_packet(sock, {
+            "type": "audio",
+            "format": "s16le",
+            "sampleRate": int(sample_rate),
+            "channels": int(channels),
+            "samplesPerChannel": int(samples_per_channel),
+            "appName": app_name,
+            "serverTimeMs": time.time() * 1000.0,
+        }, pcm_s16le)
+
+    def get_mic_chunk(self, timeout_ms: float = 0.0) -> Optional[Tuple[Dict[str, Any], bytes]]:
+        """Read one Quest mic chunk, or None if no chunk arrives before timeout.
+
+        The Quest browser page must be recording first by pressing Start Mic -> PC.
+        Chunks are the browser MediaRecorder payload, normally WebM/Opus, with
+        metadata such as mimeType in the returned header.
+        """
+        sock = self._require()
+        _send_packet(sock, {"type": "get_mic_chunk", "timeoutMs": float(timeout_ms), "time": time.time()})
+        header, payload = _read_packet(sock)
+        typ = header.get("type")
+        if typ == "mic-timeout":
+            return None
+        if typ != "mic-chunk":
+            raise FoxyIPCError(f"unexpected mic response: {header}")
+        return header, payload
+
     def ping(self) -> float:
         sock = self._require()
         t0 = time.time()

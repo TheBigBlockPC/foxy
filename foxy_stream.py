@@ -13,8 +13,9 @@ import ssl
 import struct
 import time
 import wave
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import aiohttp
 from aiohttp import web
@@ -774,15 +775,15 @@ class HubRenderer:
 
 
 class AudioToneGenerator:
-    def __init__(self, sample_rate: int = 48000, channels: int = 2, chunk_ms: int = 40):
+    def __init__(self, sample_rate: int = 48000, channels: int = 2, chunk_ms: int = 40, demo_enabled: bool = False):
         self.sample_rate = sample_rate
         self.channels = channels
         self.chunk_ms = chunk_ms
         self.phase = 0.0
-        # Off by default.  Sending demo audio before the user enables it competes
-        # with video on the same WebSocket lock and can make Quest Browser fall
-        # behind badly on weak hardware.  The Enable Audio button turns it on.
-        self.enabled = False
+        # Browser audio must be unlocked by a user gesture. The built-in demo
+        # tone is separate so IPC audio can be tested without a competing tone.
+        self.playback_enabled = False
+        self.demo_enabled = demo_enabled
 
     def generate_chunk(self) -> bytes:
         n = int(self.sample_rate * self.chunk_ms / 1000)
@@ -821,6 +822,41 @@ class MicRecorder:
             pass
 
 
+class MicChunkBuffer:
+    def __init__(self, max_chunks: int = 256):
+        self.max_chunks = max_chunks
+        self.chunks: Deque[Tuple[Dict[str, Any], bytes]] = deque(maxlen=max_chunks)
+        self.lock = asyncio.Lock()
+        self.event = asyncio.Event()
+
+    async def push(self, meta: Dict[str, Any], payload: bytes) -> None:
+        item_meta = dict(meta)
+        item_meta["bytes"] = len(payload)
+        item_meta["serverTimeMs"] = now_ms()
+        async with self.lock:
+            self.chunks.append((item_meta, payload))
+            self.event.set()
+
+    async def pop(self, timeout_ms: float = 0.0) -> Optional[Tuple[Dict[str, Any], bytes]]:
+        deadline = time.monotonic() + max(0.0, timeout_ms) / 1000.0
+        while True:
+            async with self.lock:
+                if self.chunks:
+                    item = self.chunks.popleft()
+                    if not self.chunks:
+                        self.event.clear()
+                    return item
+                self.event.clear()
+
+            remaining = deadline - time.monotonic()
+            if timeout_ms <= 0 or remaining <= 0:
+                return None
+            try:
+                await asyncio.wait_for(self.event.wait(), remaining)
+            except asyncio.TimeoutError:
+                return None
+
+
 async def ipc_read_packet(reader: asyncio.StreamReader) -> Tuple[Dict[str, Any], bytes]:
     raw_len = await reader.readexactly(4)
     n = struct.unpack("!I", raw_len)[0]
@@ -851,12 +887,13 @@ class FoxyServer:
         self.stream_seq = 0
         self.stream_epoch = 0
         self.renderer: Optional[HubRenderer] = None
-        self.audio = AudioToneGenerator()
+        self.audio = AudioToneGenerator(demo_enabled=bool(getattr(args, "demo_audio", False)))
         self.frame_task: Optional[asyncio.Task] = None
         self.audio_task: Optional[asyncio.Task] = None
         self.ipc_server: Optional[asyncio.AbstractServer] = None
         self.pending_binary: Optional[Dict[str, Any]] = None
         self.mic = MicRecorder(ROOT / "captures")
+        self.mic_chunks = MicChunkBuffer()
         self.stats = {
             "frames_sent": 0,
             "frames_dropped_server": 0,
@@ -868,8 +905,11 @@ class FoxyServer:
             "last_render_ms": 0.0,
             "last_frame_bytes": 0,
             "audio_chunks_sent": 0,
+            "ipc_audio_chunks_sent": 0,
+            "ipc_audio_bytes_sent": 0,
             "mic_chunks_received": 0,
             "mic_bytes_received": 0,
+            "mic_chunks_served_ipc": 0,
             "last_controller_summary": "",
             "ipc_clients": 0,
         }
@@ -1013,8 +1053,8 @@ class FoxyServer:
                     elif typ == "mic-meta":
                         self.pending_binary = payload
                     elif typ == "audio-control":
-                        self.audio.enabled = bool(payload.get("enabled", True))
-                        await ws.send_json({"type": "audio-state", "enabled": self.audio.enabled})
+                        self.audio.playback_enabled = bool(payload.get("enabled", True))
+                        await ws.send_json({"type": "audio-state", "enabled": self.audio.playback_enabled})
                     elif typ == "reset":
                         await self.tracking.reset()
                         if self.renderer:
@@ -1024,7 +1064,9 @@ class FoxyServer:
                         await ws.send_json({"type": "pong", "serverTimeMs": now_ms(), "clientTimeMs": payload.get("clientTimeMs")})
                 elif msg.type == aiohttp.WSMsgType.BINARY:
                     if self.pending_binary and self.pending_binary.get("type") == "mic-meta":
-                        self.mic.write(bytes(msg.data))
+                        mic_payload = bytes(msg.data)
+                        self.mic.write(mic_payload)
+                        await self.mic_chunks.push(self.pending_binary, mic_payload)
                         self.stats["mic_chunks_received"] = self.mic.chunks
                         self.stats["mic_bytes_received"] = self.mic.bytes
                         self.pending_binary = None
@@ -1066,6 +1108,19 @@ class FoxyServer:
                 elif typ == "frame":
                     header["client"] = client_name
                     await self.external_frame.set_frame(header, payload)
+                elif typ == "audio":
+                    await self.broadcast_ipc_audio(header, payload, client_name)
+                elif typ == "get_mic_chunk":
+                    timeout_ms = float(header.get("timeoutMs", 0.0) or 0.0)
+                    item = await self.mic_chunks.pop(timeout_ms)
+                    if item is None:
+                        await ipc_write_packet(writer, {"type": "mic-timeout", "time": time.time()})
+                    else:
+                        mic_meta, mic_payload = item
+                        mic_meta = dict(mic_meta)
+                        mic_meta["type"] = "mic-chunk"
+                        self.stats["mic_chunks_served_ipc"] += 1
+                        await ipc_write_packet(writer, mic_meta, mic_payload)
                 elif typ == "ping":
                     await ipc_write_packet(writer, {"type": "pong", "time": time.time()})
                 else:
@@ -1082,6 +1137,42 @@ class FoxyServer:
             except Exception:
                 pass
             log(f"IPC experience disconnected: {peer}")
+
+    async def broadcast_ipc_audio(self, header: Dict[str, Any], payload: bytes, client_name: str) -> None:
+        if not payload:
+            return
+        sample_rate = int(header.get("sampleRate") or 48000)
+        channels = int(header.get("channels") or 2)
+        if sample_rate <= 0 or channels <= 0:
+            raise RuntimeError("audio packet requires positive sampleRate and channels")
+        if len(payload) % (2 * channels) != 0:
+            raise RuntimeError("s16le audio payload length must align with channels")
+
+        samples_per_channel = int(header.get("samplesPerChannel") or (len(payload) // (2 * channels)))
+        meta = {
+            "type": "audio-meta",
+            "sampleRate": sample_rate,
+            "channels": channels,
+            "format": str(header.get("format") or "s16le"),
+            "serverTimeMs": now_ms(),
+            "samplesPerChannel": samples_per_channel,
+            "appName": str(header.get("appName") or client_name),
+            "source": "ipc",
+        }
+        dead = []
+        sent = 0
+        for ws in list(self.clients):
+            try:
+                await self.send_binary_pair_locked(ws, meta, payload)
+                sent += 1
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.clients.discard(ws)
+            self.client_locks.pop(ws, None)
+            self.client_health.pop(ws, None)
+        self.stats["ipc_audio_chunks_sent"] += sent
+        self.stats["ipc_audio_bytes_sent"] += len(payload) * sent
 
     async def start_ipc(self) -> None:
         path = pathlib.Path(self.args.ipc_path)
@@ -1162,7 +1253,7 @@ class FoxyServer:
         log(f"Audio loop running: {self.audio.sample_rate} Hz, {self.audio.channels} ch, {self.audio.chunk_ms} ms chunks")
         while True:
             started = time.perf_counter()
-            if self.clients and self.audio.enabled:
+            if self.clients and self.audio.playback_enabled and self.audio.demo_enabled:
                 try:
                     pcm = self.audio.generate_chunk()
                     meta = {"type": "audio-meta", "sampleRate": self.audio.sample_rate, "channels": self.audio.channels, "format": "s16le", "serverTimeMs": now_ms(), "samplesPerChannel": int(self.audio.sample_rate * self.audio.chunk_ms / 1000)}
@@ -1313,7 +1404,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ack-timeout-ms", type=float, default=300.0, help="Release a stuck per-client frame slot after this many ms")
     p.add_argument("--max-client-frame-age-ms", type=float, default=240.0, help="Display warning threshold only; frame dropping uses Quest-local queue age")
     p.add_argument("--resync-after-errors", type=int, default=8, help="Force a stream resync after this many consecutive client decode errors")
-    p.add_argument("--no-audio", action="store_true", help="Keep demo audio disabled. Audio is off by default until the browser requests it.")
+    p.add_argument("--demo-audio", action="store_true", help="Play the built-in PC-to-Quest test tone after the browser enables audio")
+    p.add_argument("--no-audio", action="store_true", help="Deprecated compatibility flag; demo audio is off unless --demo-audio is set")
     p.add_argument("--no-desktop", action="store_true", help="Disable desktop capture panel in hub mode")
     return p.parse_args()
 
@@ -1324,7 +1416,7 @@ def main() -> None:
         raise SystemExit("--jpeg-quality must be 30..95")
     server = FoxyServer(args)
     if args.no_audio:
-        server.audio.enabled = False
+        server.audio.demo_enabled = False
     app = server.make_app()
 
     scheme = "https" if args.tls else "http"

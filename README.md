@@ -65,6 +65,28 @@ Controls:
 - The demo uses explicit GLSL vertex/fragment shaders with procedural glow, scanlines, and trigger-driven deformation
 - Controller rays/poses: available in the state API
 
+## Run the interactive audio transfer demo
+
+Leave the server running and open the Quest browser page. Press **Enable Audio**
+on the page to allow PC -> Quest playback. Press **Start Mic -> PC** if you also
+want to test Quest mic transfer back into Python.
+
+```bash
+cd foxy_sdk
+source .venv/bin/activate
+python examples/audio_transfer_demo.py
+```
+
+Demo keys:
+
+- `t`: toggle the PCM tone sent from Python to Quest
+- `f`: cycle tone frequency
+- `+` / `-`: adjust volume
+- `q`: quit
+
+Mic chunks are shown in the demo status line and are also appended to
+`captures/quest_mic_*.webm`.
+
 
 ## Stream stabilization / ground-truth recovery
 
@@ -128,6 +150,7 @@ Quest Browser / WebXR
 Foxy server
   -> default OpenGL hub renderer
   -> desktop panel capture
+  -> PCM audio to Quest + Quest mic chunks to IPC/captures
   -> IPC Unix socket for Python experiences
   -> sends side-by-side stereo frames to Quest
 
@@ -135,6 +158,7 @@ Python experience
   -> connects to /tmp/foxy_ipc.sock
   -> receives tracking/controllers/events
   -> renders left/right eye frames with OpenGL
+  -> optionally sends PCM audio and reads Quest mic chunks
   -> sends stereo JPEG stream back to Foxy
 ```
 
@@ -207,7 +231,7 @@ This build fixes the slideshow failure mode from the previous stabilization buil
 
 Changes:
 
-- Demo audio is off by default. It no longer competes with video on the same WebSocket unless you press **Enable Audio**.
+- Browser audio is off until you press **Enable Audio**. IPC audio can then stream from Python to Quest. The built-in server tone is opt-in with `--demo-audio`.
 - The server no longer renders/encodes frames that the Quest is not ready to display. It waits for a display ACK from the XR texture upload path, then renders the next frame.
 - Client ACKs now mean "this frame reached the XR texture", not merely "JPEG decode finished".
 - Server `frames_skipped_not_ready` means the server intentionally did not render a useless frame. It is not a visible frame drop.

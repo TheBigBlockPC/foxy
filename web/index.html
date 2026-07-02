@@ -556,7 +556,7 @@ async function enableAudio() {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "audio-control", enabled: true }));
   }
-  log("Audio enabled. Demo tone should play quietly.");
+  log("Audio enabled. IPC audio will play when a Python client sends PCM.");
 }
 document.querySelector("#enableAudio").onclick = () => enableAudio().catch(e => log("Enable audio failed: " + e.message));
 

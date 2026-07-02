@@ -230,17 +230,68 @@ Default timeout:
 
 ## Audio and mic
 
-The current API focuses on visual frames and input. The built-in server already supports:
+Foxy can move audio in both directions over the same local IPC connection:
 
-- PC -> Quest demo PCM audio over WebSocket
-- Quest mic -> PC `captures/quest_mic_*.webm`
+- Python/PC -> Quest: signed 16-bit little-endian PCM chunks
+- Quest mic -> Python/PC: browser `MediaRecorder` chunks, normally WebM/Opus
 
-A future IPC extension should add:
+Quest Browser requires a user gesture before audio playback is allowed. Open the
+Foxy page and press **Enable Audio** before expecting to hear IPC audio.
+
+Send small PCM chunks with `send_audio_pcm()`:
 
 ```python
-client.send_audio_pcm(...)
-client.read_mic_chunks(...)
+client.send_audio_pcm(
+    pcm_s16le,
+    sample_rate=48000,
+    channels=2,
+    samples_per_channel=1920,  # 40 ms at 48 kHz
+    app_name="My Audio App",
+)
 ```
+
+PCM details:
+
+```text
+format: signed 16-bit little-endian
+channels: 1 for mono or 2 for stereo
+layout: interleaved by frame, e.g. L R L R for stereo
+chunk size: 20-60 ms recommended
+```
+
+Read Quest mic chunks with `get_mic_chunk()` after pressing **Start Mic -> PC**
+on the browser page:
+
+```python
+chunk = client.get_mic_chunk(timeout_ms=100)
+if chunk is not None:
+    meta, payload = chunk
+    print(meta["mimeType"], len(payload))
+```
+
+Mic chunks are compressed browser blobs. The server also appends them to:
+
+```text
+captures/quest_mic_*.webm
+```
+
+Run the interactive transfer demo:
+
+```bash
+source .venv/bin/activate
+python examples/audio_transfer_demo.py
+```
+
+Demo controls:
+
+- `t`: toggle tone
+- `f`: cycle tone frequency
+- `+` / `-`: change volume
+- `q`: quit
+
+The built-in server test tone is disabled by default so it does not compete with
+IPC audio. Start the server with `--demo-audio` if you want the hub to emit its
+own simple PC-to-Quest tone after the browser enables audio.
 
 ## Production transport roadmap
 
