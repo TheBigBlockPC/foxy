@@ -814,28 +814,6 @@ class AudioToneGenerator:
         return out.tobytes()
 
 
-class MicRecorder:
-    def __init__(self, out_dir: pathlib.Path):
-        self.out_dir = out_dir
-        self.out_dir.mkdir(parents=True, exist_ok=True)
-        self.path = self.out_dir / f"quest_mic_{time.strftime('%Y%m%d_%H%M%S')}.webm"
-        self.file = open(self.path, "ab")
-        self.chunks = 0
-        self.bytes = 0
-
-    def write(self, blob: bytes) -> None:
-        self.file.write(blob)
-        self.file.flush()
-        self.chunks += 1
-        self.bytes += len(blob)
-
-    def close(self) -> None:
-        try:
-            self.file.close()
-        except Exception:
-            pass
-
-
 class MicChunkBuffer:
     def __init__(self, max_chunks: int = 256):
         self.max_chunks = max_chunks
@@ -890,6 +868,60 @@ async def ipc_write_packet(writer: asyncio.StreamWriter, header: Dict[str, Any],
     await writer.drain()
 
 
+def encode_raw_sbs_frame(header: Dict[str, Any], payload: bytes, default_quality: int) -> Tuple[bytes, Dict[str, Any]]:
+    eye_w = int(header.get("eyeWidth") or 0)
+    eye_h = int(header.get("eyeHeight") or 0)
+    width = int(header.get("width") or (eye_w * 2))
+    height = int(header.get("height") or eye_h)
+    if eye_w <= 0 or eye_h <= 0:
+        raise RuntimeError("raw_frame requires positive eyeWidth and eyeHeight")
+    if width != eye_w * 2 or height != eye_h:
+        raise RuntimeError("raw_frame width/height must be side-by-side: width=eyeWidth*2 and height=eyeHeight")
+    if width <= 0 or height <= 0:
+        raise RuntimeError("raw_frame requires positive width and height")
+
+    fmt = str(header.get("pixelFormat") or header.get("format") or "rgb").lower().replace("-", "").replace("_", "")
+    raw_modes = {
+        "rgb": ("RGB", "RGB", 3),
+        "rgba": ("RGBA", "RGBA", 4),
+        "bgr": ("RGB", "BGR", 3),
+        "bgra": ("RGBA", "BGRA", 4),
+        "gray": ("L", "L", 1),
+        "grey": ("L", "L", 1),
+        "l": ("L", "L", 1),
+    }
+    if fmt not in raw_modes:
+        raise RuntimeError(f"unsupported raw_frame pixelFormat {fmt!r}; use rgb, rgba, bgr, bgra, or gray")
+    mode, raw_mode, channels = raw_modes[fmt]
+    expected = width * height * channels
+    if len(payload) != expected:
+        raise RuntimeError(f"raw_frame payload has {len(payload)} bytes, expected {expected} for {width}x{height} {fmt}")
+
+    if raw_mode == mode:
+        img = Image.frombytes(mode, (width, height), payload)
+    else:
+        img = Image.frombytes(mode, (width, height), payload, "raw", raw_mode)
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+
+    quality = int(header.get("jpegQuality") or default_quality)
+    quality = max(30, min(95, quality))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality, optimize=False)
+
+    meta = dict(header)
+    meta["type"] = "frame"
+    meta["encoding"] = "jpeg-sbs"
+    meta["sourceEncoding"] = "raw-sbs"
+    meta["pixelFormat"] = fmt
+    meta["width"] = width
+    meta["height"] = height
+    meta["eyeWidth"] = eye_w
+    meta["eyeHeight"] = eye_h
+    meta["serverTimeMs"] = now_ms()
+    return buf.getvalue(), meta
+
+
 class FoxyServer:
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -910,7 +942,6 @@ class FoxyServer:
         self.ipc_server: Optional[asyncio.AbstractServer] = None
         self.hotspot: Optional[FoxyHotspotProcess] = None
         self.pending_binary: Optional[Dict[str, Any]] = None
-        self.mic = MicRecorder(ROOT / "captures")
         self.mic_chunks = MicChunkBuffer()
         self.stats = {
             "frames_sent": 0,
@@ -1109,10 +1140,9 @@ class FoxyServer:
                 elif msg.type == aiohttp.WSMsgType.BINARY:
                     if self.pending_binary and self.pending_binary.get("type") == "mic-meta":
                         mic_payload = bytes(msg.data)
-                        self.mic.write(mic_payload)
                         await self.mic_chunks.push(self.pending_binary, mic_payload)
-                        self.stats["mic_chunks_received"] = self.mic.chunks
-                        self.stats["mic_bytes_received"] = self.mic.bytes
+                        self.stats["mic_chunks_received"] += 1
+                        self.stats["mic_bytes_received"] += len(mic_payload)
                         self.pending_binary = None
                 elif msg.type == aiohttp.WSMsgType.ERROR:
                     log(f"WebSocket error: {ws.exception()}")
@@ -1201,6 +1231,14 @@ class FoxyServer:
                 elif typ == "frame":
                     header["client"] = client_name
                     await self.external_frame.set_frame(header, payload)
+                elif typ == "raw_frame":
+                    header["client"] = client_name
+                    try:
+                        jpeg, encoded_header = await asyncio.to_thread(encode_raw_sbs_frame, header, payload, self.args.jpeg_quality)
+                    except Exception as e:
+                        await ipc_write_packet(writer, {"type": "error", "message": f"raw_frame encode failed: {e}"})
+                    else:
+                        await self.external_frame.set_frame(encoded_header, jpeg)
                 elif typ == "audio":
                     await self.broadcast_ipc_audio(header, payload, client_name)
                 elif typ == "get_mic_chunk":
@@ -1520,7 +1558,6 @@ class FoxyServer:
         if self.ipc_server:
             self.ipc_server.close()
             await self.ipc_server.wait_closed()
-        self.mic.close()
         try:
             pathlib.Path(self.args.ipc_path).unlink()
         except Exception:

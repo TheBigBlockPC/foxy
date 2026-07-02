@@ -8,6 +8,7 @@ It gives you:
 - Quest Browser/WebXR client for headset pose, per-eye matrices, controllers, audio, and mic.
 - A local Unix-socket **IPC Python API**.
 - External Python experiences that receive all Quest data and send their own left/right eye stream.
+- Experiences can send either already-encoded JPEG frames or raw RGB/RGBA/BGR/BGRA/gray frames for Foxy to JPEG-encode.
 - An OpenGL demo experience showing stick movement, A/B/X/Y-style buttons, triggers, grips, and stereo rendering.
 - A desktop preview panel in the hub when desktop capture is available.
 
@@ -84,8 +85,21 @@ Demo keys:
 - `+` / `-`: adjust volume
 - `q`: quit
 
-Mic chunks are shown in the demo status line and are also appended to
-`captures/quest_mic_*.webm`.
+Mic chunks are shown in the demo status line and are kept in memory for IPC
+consumers; Foxy no longer writes mic data to disk.
+
+## Run the raw-frame IPC experience
+
+Leave the server running. In another terminal:
+
+```bash
+cd foxy_sdk
+source .venv/bin/activate
+python examples/raw_frame_experience.py
+```
+
+This demo sends side-by-side raw RGB NumPy arrays with `send_raw_frame()`. Foxy
+encodes them as JPEG before streaming them to the Quest.
 
 
 ## Stream stabilization / ground-truth recovery
@@ -183,7 +197,7 @@ Quest Browser / WebXR
 Foxy server
   -> default OpenGL hub renderer
   -> desktop panel capture
-  -> PCM audio to Quest + Quest mic chunks to IPC/captures
+  -> PCM audio to Quest + Quest mic chunks to IPC
   -> IPC Unix socket for Python experiences
   -> sends side-by-side stereo frames to Quest
 
@@ -192,7 +206,7 @@ Python experience
   -> receives tracking/controllers/events
   -> renders left/right eye frames with OpenGL
   -> optionally sends PCM audio and reads Quest mic chunks
-  -> sends stereo JPEG stream back to Foxy
+  -> sends stereo JPEG stream or raw side-by-side frames back to Foxy
 ```
 
 ## Limitations

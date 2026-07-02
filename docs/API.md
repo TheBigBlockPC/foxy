@@ -57,6 +57,18 @@ while True:
     )
 ```
 
+If your renderer already has raw pixels and you want Foxy to encode JPEG:
+
+```python
+raw_sbs = render_raw_rgb_sbs(state)  # uint8 shape: (eye_h, eye_w * 2, 3)
+client.send_raw_frame(
+    raw_sbs,
+    eye_width=960,
+    eye_height=960,
+    app_name="My Raw Experience",
+)
+```
+
 ## State schema
 
 `client.get_state()` returns:
@@ -196,6 +208,34 @@ right eye = right half
 
 `render_views` is recommended because the Quest client uses it for rotational reprojection.
 
+Use `send_raw_frame()` when your renderer has pixels but not a JPEG:
+
+```python
+client.send_raw_frame(
+    raw_sbs,
+    eye_width=960,
+    eye_height=960,
+    pixel_format="rgb",
+    app_name="My Raw App",
+)
+```
+
+The raw frame format is also side-by-side:
+
+```text
+raw uint8 buffer or NumPy array
+width = eye_width * 2
+height = eye_height
+
+left eye  = left half
+right eye = right half
+```
+
+Supported pixel formats are `rgb`, `rgba`, `bgr`, `bgra`, and `gray`. NumPy
+arrays shaped `(height, width, 3)`, `(height, width, 4)`, or `(height, width)`
+are accepted directly. Foxy encodes the raw frame as JPEG using the server's
+`--jpeg-quality`, unless you pass `jpeg_quality=` to `send_raw_frame()`.
+
 ## OpenGL matrix notes
 
 WebXR matrices arrive as column-major arrays. In Python/Numpy, use:
@@ -269,11 +309,8 @@ if chunk is not None:
     print(meta["mimeType"], len(payload))
 ```
 
-Mic chunks are compressed browser blobs. The server also appends them to:
-
-```text
-captures/quest_mic_*.webm
-```
+Mic chunks are compressed browser blobs and are kept in memory for IPC readers;
+Foxy does not write mic data to disk.
 
 Run the interactive transfer demo:
 

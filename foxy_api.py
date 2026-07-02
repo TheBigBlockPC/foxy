@@ -18,8 +18,8 @@ Typical loop:
 
     while True:
         state = client.get_state()
-        jpeg = render_stereo_frame(state)
-        client.send_frame(jpeg, eye_width=960, eye_height=960, render_views=...)
+        raw = render_stereo_rgb_frame(state)
+        client.send_raw_frame(raw, eye_width=960, eye_height=960, render_views=...)
 """
 
 from __future__ import annotations
@@ -346,6 +346,86 @@ class FoxyClient:
             header["renderViews"] = render_views
             header["reprojection"] = "client-rotational-timewarp-v1"
         _send_packet(sock, header, jpeg_sbs)
+
+    def send_raw_frame(
+        self,
+        raw_sbs: Any,
+        *,
+        eye_width: Optional[int] = None,
+        eye_height: Optional[int] = None,
+        pixel_format: Optional[str] = None,
+        render_views: Optional[Dict[str, Any]] = None,
+        app_name: str = "foxy-experience",
+        frame_id: Optional[int] = None,
+        jpeg_quality: Optional[int] = None,
+    ) -> None:
+        """Send one raw side-by-side stereo frame and let Foxy JPEG-encode it.
+
+        `raw_sbs` may be a NumPy array or a bytes-like object. NumPy arrays are
+        expected to be shaped `(eye_height, eye_width * 2, channels)` for RGB,
+        RGBA, BGR, or BGRA, or `(eye_height, eye_width * 2)` for grayscale.
+
+        For bytes-like input, pass `eye_width`, `eye_height`, and
+        `pixel_format`. Supported pixel formats are `rgb`, `rgba`, `bgr`,
+        `bgra`, and `gray`.
+        """
+        width: int
+        height: int
+        payload: bytes
+
+        if isinstance(raw_sbs, np.ndarray):
+            arr = np.ascontiguousarray(raw_sbs)
+            if arr.dtype != np.uint8:
+                raise ValueError("raw_sbs NumPy arrays must use dtype uint8")
+            if arr.ndim == 2:
+                height, width = int(arr.shape[0]), int(arr.shape[1])
+                inferred_format = "gray"
+            elif arr.ndim == 3 and arr.shape[2] in (3, 4):
+                height, width = int(arr.shape[0]), int(arr.shape[1])
+                inferred_format = "rgb" if arr.shape[2] == 3 else "rgba"
+            else:
+                raise ValueError("raw_sbs array must have shape (h,w), (h,w,3), or (h,w,4)")
+            payload = arr.tobytes()
+            if pixel_format is None:
+                pixel_format = inferred_format
+        else:
+            if eye_width is None or eye_height is None:
+                raise ValueError("bytes-like raw_sbs requires eye_width and eye_height")
+            payload = bytes(raw_sbs)
+            height = int(eye_height)
+            width = int(eye_width) * 2
+            if pixel_format is None:
+                pixel_format = "rgb"
+
+        if eye_width is None:
+            if width % 2 != 0:
+                raise ValueError("raw_sbs width must be even so it can be split into two eyes")
+            eye_width = width // 2
+        if eye_height is None:
+            eye_height = height
+        if width != int(eye_width) * 2 or height != int(eye_height):
+            raise ValueError("raw_sbs must be side-by-side: width=eye_width*2 and height=eye_height")
+
+        sock = self._require()
+        header = {
+            "type": "raw_frame",
+            "encoding": "raw-sbs",
+            "pixelFormat": str(pixel_format or "rgb").lower(),
+            "width": int(width),
+            "height": int(height),
+            "eyeWidth": int(eye_width),
+            "eyeHeight": int(eye_height),
+            "appName": app_name,
+            "serverTimeMs": time.time() * 1000.0,
+        }
+        if jpeg_quality is not None:
+            header["jpegQuality"] = int(jpeg_quality)
+        if frame_id is not None:
+            header["frame"] = int(frame_id)
+        if render_views is not None:
+            header["renderViews"] = render_views
+            header["reprojection"] = "client-rotational-timewarp-v1"
+        _send_packet(sock, header, payload)
 
     def send_audio_pcm(
         self,

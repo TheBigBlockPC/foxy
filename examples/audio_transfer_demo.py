@@ -3,7 +3,7 @@
 
 Run the Foxy server and open the Quest browser page first. Press Enable Audio
 on the page to hear PC -> Quest PCM. Press Start Mic -> PC to stream mic blobs
-back to this demo and to the captures/ folder.
+back to this demo over IPC.
 """
 
 from __future__ import annotations

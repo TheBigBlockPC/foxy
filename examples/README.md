@@ -29,6 +29,16 @@ Shows:
 - trigger and grip analog values
 - `renderViews` for client-side reprojection
 
+## Raw RGB frame demo
+
+```bash
+source .venv/bin/activate
+python examples/raw_frame_experience.py
+```
+
+Shows the second frame API: the example sends raw side-by-side RGB NumPy arrays
+and Foxy JPEG-encodes them before streaming to the Quest.
+
 ## Audio transfer demo
 
 ```bash
