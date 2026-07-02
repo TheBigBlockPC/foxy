@@ -14,7 +14,7 @@ openssl req -x509 -newkey rsa:2048 \
   -days 365 \
   -nodes \
   -subj "/CN=foxy.local" \
-  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:${IP}"
+  -addext "subjectAltName=DNS:foxy.local,DNS:localhost,IP:127.0.0.1,IP:10.42.0.1,IP:${IP}"
 
 echo "Created certs/cert.pem and certs/key.pem"
 echo "Detected IP: ${IP}"

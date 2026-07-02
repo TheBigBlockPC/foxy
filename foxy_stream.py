@@ -11,6 +11,8 @@ import os
 import pathlib
 import ssl
 import struct
+import sys
+import tempfile
 import time
 import wave
 from collections import deque
@@ -39,6 +41,8 @@ except Exception:
 ROOT = pathlib.Path(__file__).resolve().parent
 WEB_ROOT = ROOT / "web"
 DEFAULT_IPC_PATH = os.environ.get("FOXY_IPC", "/tmp/foxy_ipc.sock")
+DEFAULT_HOTSPOT_DOMAIN = "foxy.local"
+DEFAULT_HOTSPOT_ADDRESS = "10.42.0.1"
 
 
 def now_ms() -> float:
@@ -891,6 +895,7 @@ class FoxyServer:
         self.frame_task: Optional[asyncio.Task] = None
         self.audio_task: Optional[asyncio.Task] = None
         self.ipc_server: Optional[asyncio.AbstractServer] = None
+        self.hotspot: Optional[FoxyHotspotProcess] = None
         self.pending_binary: Optional[Dict[str, Any]] = None
         self.mic = MicRecorder(ROOT / "captures")
         self.mic_chunks = MicChunkBuffer()
@@ -942,6 +947,12 @@ class FoxyServer:
             "eyeHeight": self.args.eye_height,
             "fps": self.args.fps,
             "ipcPath": self.args.ipc_path,
+            "hotspot": {
+                "enabled": bool(getattr(self.args, "hotspot", False)),
+                "ssid": getattr(self.args, "hotspot_ssid", "foxy"),
+                "domain": getattr(self.args, "hotspot_domain", DEFAULT_HOTSPOT_DOMAIN),
+                "address": getattr(self.args, "hotspot_address", DEFAULT_HOTSPOT_ADDRESS),
+            },
         })
 
     def summarize_inputs(self, inputs: List[Dict[str, Any]]) -> str:
@@ -1349,6 +1360,9 @@ class FoxyServer:
             await asyncio.sleep(max(0.0, period - elapsed))
 
     async def on_startup(self, app: web.Application) -> None:
+        if getattr(self.args, "hotspot", False):
+            self.hotspot = FoxyHotspotProcess(self.args)
+            await self.hotspot.start()
         log("Initializing OpenGL hub renderer...")
         await self.init_renderer()
         await self.start_ipc()
@@ -1368,9 +1382,27 @@ class FoxyServer:
             pathlib.Path(self.args.ipc_path).unlink()
         except Exception:
             pass
+        if self.hotspot:
+            await self.hotspot.stop()
+
+    @web.middleware
+    async def hotspot_domain_middleware(self, request: web.Request, handler):
+        allowed_hosts = {
+            str(getattr(self.args, "hotspot_domain", DEFAULT_HOTSPOT_DOMAIN)).lower().rstrip("."),
+            str(getattr(self.args, "hotspot_address", DEFAULT_HOTSPOT_ADDRESS)),
+            "127.0.0.1",
+            "localhost",
+        }
+        host = request.host.rsplit(":", 1)[0].lower().rstrip(".")
+        if host and host not in allowed_hosts:
+            raise web.HTTPNotFound(text=f"Foxy hotspot only serves {self.args.hotspot_domain}\n")
+        return await handler(request)
 
     def make_app(self) -> web.Application:
-        app = web.Application()
+        middlewares = []
+        if getattr(self.args, "hotspot", False):
+            middlewares.append(self.hotspot_domain_middleware)
+        app = web.Application(middlewares=middlewares)
         app.router.add_get("/", self.index)
         app.router.add_get("/ws", self.websocket)
         app.router.add_get("/status", self.status)
@@ -1378,6 +1410,74 @@ class FoxyServer:
         app.on_startup.append(self.on_startup)
         app.on_cleanup.append(self.on_cleanup)
         return app
+
+
+class FoxyHotspotProcess:
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.proc: Optional[asyncio.subprocess.Process] = None
+        self.ready_file = pathlib.Path(tempfile.gettempdir()) / f"foxy-hotspot-ready-{os.getpid()}"
+
+    def build_command(self) -> List[str]:
+        helper = ROOT / "scripts" / "foxy-hotspot-helper.py"
+        cmd = [
+            sys.executable,
+            str(helper),
+            "--ssid",
+            self.args.hotspot_ssid,
+            "--password",
+            self.args.hotspot_password,
+            "--domain",
+            self.args.hotspot_domain,
+            "--address",
+            self.args.hotspot_address,
+            "--server-port",
+            str(self.args.port),
+            "--ready-file",
+            str(self.ready_file),
+        ]
+        if self.args.hotspot_interface:
+            cmd.extend(["--interface", self.args.hotspot_interface])
+        if self.args.hotspot_country:
+            cmd.extend(["--country", self.args.hotspot_country])
+        if os.geteuid() != 0 and not self.args.hotspot_no_sudo:
+            return ["sudo", "-E", *cmd]
+        return cmd
+
+    async def start(self) -> None:
+        cmd = self.build_command()
+        try:
+            self.ready_file.unlink()
+        except FileNotFoundError:
+            pass
+        log(f"Starting Foxy hotspot helper: {' '.join(cmd)}")
+        self.proc = await asyncio.create_subprocess_exec(*cmd)
+        deadline = time.monotonic() + 45.0
+        while time.monotonic() < deadline:
+            if self.ready_file.exists():
+                break
+            if self.proc.returncode is not None:
+                raise RuntimeError(f"Foxy hotspot helper exited early with status {self.proc.returncode}")
+            await asyncio.sleep(0.25)
+        else:
+            await self.stop()
+            raise RuntimeError("Timed out waiting for Foxy hotspot helper to become ready")
+        log(f"Hotspot helper running. Open https://{self.args.hotspot_domain}:{self.args.port}")
+
+    async def stop(self) -> None:
+        try:
+            self.ready_file.unlink()
+        except FileNotFoundError:
+            pass
+        if not self.proc or self.proc.returncode is not None:
+            return
+        log("Stopping Foxy hotspot helper...")
+        self.proc.terminate()
+        try:
+            await asyncio.wait_for(self.proc.wait(), timeout=8.0)
+        except asyncio.TimeoutError:
+            self.proc.kill()
+            await self.proc.wait()
 
 
 def build_ssl_context() -> Optional[ssl.SSLContext]:
@@ -1407,6 +1507,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--demo-audio", action="store_true", help="Play the built-in PC-to-Quest test tone after the browser enables audio")
     p.add_argument("--no-audio", action="store_true", help="Deprecated compatibility flag; demo audio is off unless --demo-audio is set")
     p.add_argument("--no-desktop", action="store_true", help="Disable desktop capture panel in hub mode")
+    p.add_argument("--hotspot", action="store_true", help="Start an isolated Wi-Fi AP helper for Quest access at foxy.local")
+    p.add_argument("--hotspot-ssid", default="foxy", help="SSID for --hotspot")
+    p.add_argument("--hotspot-password", default="foxy", help="WPA2 password for --hotspot; Wi-Fi standards require 8..63 chars, or empty for open")
+    p.add_argument("--hotspot-domain", default=DEFAULT_HOTSPOT_DOMAIN, help="DNS name served by --hotspot")
+    p.add_argument("--hotspot-address", default=DEFAULT_HOTSPOT_ADDRESS, help="IPv4 address assigned to the Foxy AP interface")
+    p.add_argument("--hotspot-interface", default="", help="Wi-Fi interface to use for --hotspot; autodetected when omitted")
+    p.add_argument("--hotspot-country", default=os.environ.get("FOXY_HOTSPOT_COUNTRY", ""), help="Optional two-letter regulatory country for hostapd")
+    p.add_argument("--hotspot-no-sudo", action="store_true", help="Do not auto-run the hotspot helper through sudo when not root")
     return p.parse_args()
 
 
@@ -1414,6 +1522,11 @@ def main() -> None:
     args = parse_args()
     if args.jpeg_quality < 30 or args.jpeg_quality > 95:
         raise SystemExit("--jpeg-quality must be 30..95")
+    if args.hotspot:
+        if args.host == "127.0.0.1":
+            args.host = "0.0.0.0"
+        if not args.tls:
+            args.tls = True
     server = FoxyServer(args)
     if args.no_audio:
         server.audio.demo_enabled = False
@@ -1422,7 +1535,9 @@ def main() -> None:
     scheme = "https" if args.tls else "http"
     log(f"Serving {scheme}://{args.host}:{args.port}")
     log(f"IPC: {args.ipc_path}")
-    if args.host == "127.0.0.1" and not args.tls:
+    if args.hotspot:
+        log(f"Hotspot mode: SSID={args.hotspot_ssid!r}, URL=https://{args.hotspot_domain}:{args.port}")
+    elif args.host == "127.0.0.1" and not args.tls:
         log("Quest USB mode: run scripts/adb-localhost.sh and open http://localhost:PORT in Quest Browser")
     elif not args.tls:
         log("Warning: non-localhost HTTP will usually not allow WebXR. Use --tls for Wi-Fi.")

@@ -1,5 +1,17 @@
 # Foxy Examples
 
+Run the Foxy server first. USB localhost mode still works as before; for an
+isolated local-only Quest AP you can also run:
+
+```bash
+./make-cert.sh
+./run.sh --hotspot --hotspot-password foxyfoxy
+```
+
+Then open `https://foxy.local:8766` on the Quest. The helper tears the hotspot
+down when the server exits. WPA/WPA2 cannot use the literal password `foxy`
+because Wi-Fi passphrases must be at least 8 characters.
+
 ## OpenGL controller demo
 
 ```bash

@@ -124,6 +124,32 @@ https://YOUR_PC_IP:8766
 
 Accept the self-signed cert warning.
 
+### Isolated Foxy hotspot
+
+For a local-only Quest link with no internet forwarding, Foxy can start a helper
+process that creates a Wi-Fi AP, DHCP, and DNS for `foxy.local`:
+
+```bash
+./make-cert.sh
+./run.sh --hotspot --hotspot-password foxyfoxy
+```
+
+Open on Quest Browser:
+
+```text
+https://foxy.local:8766
+```
+
+The helper tries 5 GHz first and falls back to 2.4 GHz if the Wi-Fi card or
+regulatory domain does not allow 5 GHz AP mode. When Foxy exits, it stops the
+hotspot and restores the interface. The helper uses `hostapd`, `dnsmasq`, and
+root privileges; if Foxy is not already root it starts the helper through `sudo`.
+
+The v0 SSID default is `foxy`. The requested password `foxy` is kept as the CLI
+default, but WPA/WPA2 requires 8 to 63 characters, so Linux AP tooling rejects
+that literal value. Use an 8+ character `--hotspot-password`, or pass an empty
+password for an open local-only AP.
+
 ## Disable desktop capture
 
 ```bash
